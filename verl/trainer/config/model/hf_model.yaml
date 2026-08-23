@@ -96,6 +96,65 @@ mtp:
   method: mtp
   num_speculative_tokens: 1
 
+# EAGLE3 online speculative decoding / draft-model training (design 4.0: Megatron backend)
+eagle3:
+
+  _target_: verl.workers.config.Eagle3Config
+
+  # main switches
+  enable: False
+
+  enable_train: False
+
+  enable_rollout: False
+
+  draft_model_path: ""
+
+  loss_weight: 1.0
+
+  capture_layer_ids: []
+
+  method: eagle3
+
+  num_speculative_tokens: 3
+
+  # draft independent optimizer hyperparams
+  draft_optim_lr: 1e-4
+
+  draft_optim_weight_decay: 0.01
+
+  draft_optim_clip_grad: 1.0
+
+  draft_optim_offload: False
+
+  # activation-checkpoint the draft backbone (time-for-memory); default off (P5-09)
+  draft_forward_checkpoint: False
+
+  # vocab compression switch
+  enable_vocab_compression: False
+
+  draft_vocab_size: 0
+
+  vocab_mapping_path: ""
+
+  # 4.0 Megatron backend
+  backend: megatron
+
+  ttt_length: 1
+
+  draft_pipeline_stage: last
+
+  allow_pp_gt_1: False
+
+  # draft implementation backend (P6): True = MegatronModule + TP-sharded backbone;
+  # False = plain nn.Module + DDP (default, stable). Must be in this struct or Hydra
+  # rejects the launch-script override (see P5-09 startup pitfall).
+  use_megatron_draft: False
+
+  # draft TP degree (use_megatron_draft=True only). 0 = auto (follow policy TP, capped
+  # to a divisor of num_query_groups). Smaller divisor -> dedicated draft TP sub-group.
+  draft_tensor_parallel_size: 0
+
 # LoRA (Low-Rank Adaptation) configuration for parameter-efficient fine-tuning
 lora:
   # LoRA type: "lora", "vlm_lora", "canonical_lora", or "dora"

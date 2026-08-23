@@ -220,15 +220,25 @@ class vLLMColocateWorkerExtension:
         return spec.draft_model_config if spec is not None and spec.draft_model_config is not None else None
 
     def _use_mtp_drafter_weight_sync(self):
-        """Return whether the vLLM MTP drafter should receive actor weights."""
+        """Return whether the vLLM drafter should receive actor weights.
+
+        Supports both MTP (drafter receives full base-model weights) and EAGLE3
+        (drafter receives only draft.-prefixed weights from actor refit).
+        """
         spec = self.model_runner.vllm_config.speculative_config
-        return spec is not None and spec.method == "mtp" and self._get_drafter_model() is not None
+        return (
+            spec is not None
+            and spec.method in ("mtp", "eagle3")
+            and self._get_drafter_model() is not None
+        )
 
     def _iter_all_models(self):
         """Yield models that need weight updates.
 
-        Only vLLM MTP drafter sync is supported for now. Independent non-MTP
-        draft models are not compatible with actor weight loading through this path.
+        Supports both MTP and EAGLE3 drafter sync. MTP drafters receive full base-model
+        weights; EAGLE3 drafters receive only draft.-prefixed weights (handled by the
+        caller's routing logic). Independent non-MTP/non-EAGLE3 draft models are not
+        compatible with actor weight loading through this path.
         """
         yield self.model_runner.model
         if self._use_mtp_drafter_weight_sync():
@@ -248,6 +258,22 @@ class vLLMColocateWorkerExtension:
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
+
+    def pop_policy_verify_timing(self) -> dict:
+        """Return + reset this worker's accumulated EAGLE3 policy-verify timing.
+
+        Timing (target forward / forward+rejection ms sums + count) is accumulated
+        per speculative verify step by NPUModelRunner into a process-local accumulator
+        in vllm_ascend.worker.model_runner_v1. Called via collective_rpc from the
+        rollout server. Returns zeros if the accumulator is unavailable (non-NPU /
+        no spec decode).
+        """
+        try:
+            from vllm_ascend.worker.model_runner_v1 import pop_policy_verify_timing
+
+            return pop_policy_verify_timing()
+        except Exception:
+            return {"policy_forward_ms_sum": 0.0, "policy_forward_rejection_ms_sum": 0.0, "n": 0}
 
     @staticmethod
     def _map_weight_name_for_vllm(model, weight_name: str) -> str | None:
@@ -350,6 +376,47 @@ class vLLMColocateWorkerExtension:
         model = self.model_runner.model
         model_weight_names = {name for name, _ in model.named_parameters(remove_duplicate=False)}
         model_weight_names.update(name for name, _ in model.named_buffers())
+
+        logger.info(f"🔥 _iter_normalized_base_sync_weights: initial model_weight_names count={len(model_weight_names)}")
+        logger.info(f"🔥 _use_mtp_drafter_weight_sync()={self._use_mtp_drafter_weight_sync()}")
+
+        # 🔥 FIX: For EAGLE3 MTP drafter, also include draft model parameter names.
+        # Draft weights arrive with "draft." prefix; we need to accept them by checking
+        # the unprefixed name against the drafter's actual parameter names.
+        if self._use_mtp_drafter_weight_sync():
+            logger.info("🔥 MTP drafter weight sync is enabled")
+            draft_model = getattr(self.model_runner.model, "draft_model", None) or \
+                          getattr(self.model_runner.model, "drafter", None)
+            logger.info(f"🔥 draft_model found: {draft_model is not None}")
+            if draft_model is not None:
+                # Add draft param names WITH the "draft." prefix so they pass validation
+                draft_count = 0
+                for name, _ in draft_model.named_parameters(remove_duplicate=False):
+                    model_weight_names.add(f"draft.{name}")
+                    draft_count += 1
+                for name, _ in draft_model.named_buffers():
+                    model_weight_names.add(f"draft.{name}")
+                    draft_count += 1
+                logger.info(f"🔥 Added {draft_count} draft weight names to validation set")
+                logger.info(f"🔥 Total model_weight_names count={len(model_weight_names)}")
+        else:
+            logger.info("🔥 MTP drafter weight sync is NOT enabled, checking for draft. prefix in weights")
+            # Even if MTP sync is not enabled, still add draft model params if we see draft. prefix
+            has_draft_prefix = any(name.startswith("draft.") for name, _ in weights)
+            logger.info(f"🔥 Found draft. prefix in weights: {has_draft_prefix}")
+            if has_draft_prefix:
+                draft_model = getattr(self.model_runner.model, "draft_model", None) or \
+                              getattr(self.model_runner.model, "drafter", None)
+                logger.info(f"🔥 draft_model found: {draft_model is not None}")
+                if draft_model is not None:
+                    draft_count = 0
+                    for name, _ in draft_model.named_parameters(remove_duplicate=False):
+                        model_weight_names.add(f"draft.{name}")
+                        draft_count += 1
+                    for name, _ in draft_model.named_buffers():
+                        model_weight_names.add(f"draft.{name}")
+                        draft_count += 1
+                    logger.info(f"🔥 Added {draft_count} draft weight names (fallback path)")
 
         for name, tensor in weights:
             normalized_name = self._resolve_weight_name_for_vllm(
@@ -500,6 +567,28 @@ class vLLMColocateWorkerExtension:
             apply_buffer_updates(model, buffer_updates)
         return loaded
 
+    def _split_weights_by_draft_prefix(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> tuple[list[tuple[str, torch.Tensor]], list[tuple[str, torch.Tensor]]]:
+        """Split weights into base-model and draft-model sets by the 'draft.' prefix.
+
+        For EAGLE3, actor refit exports draft weights with 'draft.' prefix; we strip
+        the prefix and route them to the drafter, while base-model weights go to the
+        main model. MTP doesn't use prefixed weights, so this returns all weights for
+        both models when prefix is absent.
+
+        Returns:
+            (base_weights, draft_weights) where draft weights have prefix stripped.
+        """
+        base_weights = []
+        draft_weights = []
+        for name, tensor in weights:
+            if name.startswith("draft."):
+                draft_weights.append((name[len("draft.") :], tensor))
+            else:
+                base_weights.append((name, tensor))
+        return base_weights, draft_weights
+
     def _update_weights(
         self,
         weights: list[tuple[str, torch.Tensor]],
@@ -507,6 +596,26 @@ class vLLMColocateWorkerExtension:
         base_sync_done: bool,
         quant_prepared: bool = False,
     ):
+        logger.info(f"🔥 _update_weights called: total_weights={len(weights)}, peft_config={peft_config is not None}, base_sync_done={base_sync_done}")
+        if len(weights) > 0:
+            logger.info(f"   First 10 weight names: {[name for name, _ in weights[:10]]}")
+
+        # ===== VLLM_PATH_PROBE_REVERT_20260821 (排查用,回退时删除本块) =====
+        try:
+            import vllm as _vllm_probe
+            import vllm.model_executor.models.llama_eagle3 as _eagle_probe
+            logger.info(f"🧭 VLLM_PATH_PROBE: vllm.__file__={_vllm_probe.__file__}")
+            logger.info(f"🧭 VLLM_PATH_PROBE: llama_eagle3.__file__={_eagle_probe.__file__}")
+            _drafter_probe = self._get_drafter_model()
+            if _drafter_probe is not None:
+                import inspect as _inspect_probe
+                _lw = type(_drafter_probe).load_weights
+                logger.info(f"🧭 VLLM_PATH_PROBE: drafter={type(_drafter_probe).__name__}, "
+                            f"load_weights@{_inspect_probe.getsourcefile(_lw)}")
+        except Exception as _e_probe:
+            logger.info(f"🧭 VLLM_PATH_PROBE failed: {_e_probe}")
+        # ===== END VLLM_PATH_PROBE_REVERT_20260821 =====
+
         if peft_config and base_sync_done:
             weights = dict(weights)
             lora_request = TensorLoRARequest(
@@ -520,7 +629,11 @@ class vLLMColocateWorkerExtension:
             logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             weights = list(self._iter_normalized_base_sync_weights(weights))
+            logger.info(f"🔥 After _iter_normalized_base_sync_weights: {len(weights)} weights")
+            if len(weights) > 0:
+                logger.info(f"   First 10: {[name for name, _ in weights[:10]]}")
             param_updates, buffer_updates, named_buffers = split_buffer_updates(self.model_runner.model, weights)
+            logger.info(f"🔥 After split_buffer_updates: param_updates={len(param_updates)}, buffer_updates={len(buffer_updates)}")
             # Add the FP8 related logic here as sharding manager has been deprecated.
             # Check if FP8 quantization is enabled and apply appropriate weight loading
             if is_fp8_model(self.model_runner.vllm_config):
@@ -530,18 +643,88 @@ class vLLMColocateWorkerExtension:
                 loaded_params = (
                     load_quanted_weights(param_updates, self.model_runner, **reload_kwargs) if param_updates else []
                 )
-                # Keep the draft model in sync when present.
+                # Keep the draft model in sync when present
                 if self._use_mtp_drafter_weight_sync() and param_updates:
-                    drafter_updates = self._adapt_weight_names_for_model(self._get_drafter_model(), param_updates)
-                    load_quanted_weights(drafter_updates, self.model_runner, is_drafter=True, **reload_kwargs)
+                    spec = self.model_runner.vllm_config.speculative_config
+                    is_eagle3 = spec is not None and spec.method == "eagle3"
+
+                    if is_eagle3:
+                        # EAGLE3: route only draft.-prefixed weights to drafter
+                        _, draft_weights = self._split_weights_by_draft_prefix(param_updates)
+                        if draft_weights:
+                            drafter_updates = self._adapt_weight_names_for_model(self._get_drafter_model(), draft_weights)
+                            load_quanted_weights(drafter_updates, self.model_runner, is_drafter=True, **reload_kwargs)
+                    else:
+                        # MTP: drafter gets all weights
+                        drafter_updates = self._adapt_weight_names_for_model(self._get_drafter_model(), param_updates)
+                        load_quanted_weights(drafter_updates, self.model_runner, is_drafter=True, **reload_kwargs)
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
                 logger.info(
                     f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}, loaded_buffers: {loaded_buffers}"
                 )
             else:
                 if param_updates:
-                    for model in self._iter_all_models():
-                        model.load_weights(self._adapt_weight_names_for_model(model, param_updates))
+                    # For EAGLE3, split weights by draft. prefix and route accordingly
+                    spec = self.model_runner.vllm_config.speculative_config
+                    is_eagle3 = spec is not None and spec.method == "eagle3"
+
+                    if is_eagle3 and self._use_mtp_drafter_weight_sync():
+                        logger.info(f"🔥 EAGLE3: Before split, param_updates has {len(param_updates)} weights")
+                        logger.info(f"   First 10: {[name for name, _ in param_updates[:10]]}")
+                        base_weights, draft_weights = self._split_weights_by_draft_prefix(param_updates)
+                        logger.info(f"🔥 EAGLE3: After split, base={len(base_weights)}, draft={len(draft_weights)}")
+                        # Load base weights to main model
+                        if base_weights:
+                            self.model_runner.model.load_weights(
+                                self._adapt_weight_names_for_model(self.model_runner.model, base_weights)
+                            )
+                        # Load draft weights to drafter
+                        if draft_weights:
+                            drafter = self._get_drafter_model()
+                            adapted_weights = self._adapt_weight_names_for_model(drafter, draft_weights)
+
+                            # 🔥 DEBUG: Print weights being passed to drafter.load_weights()
+                            if self.local_rank == 0:
+                                print("=" * 80)
+                                print(f"🔥 DEBUG: Weights passed to drafter.load_weights() - Total: {len(adapted_weights)}")
+                                for i, (name, tensor) in enumerate(adapted_weights[:20], 1):  # Show first 20
+                                    print(f"  [{i:2d}] {name:60s} shape={tuple(tensor.shape)}")
+                                if len(adapted_weights) > 20:
+                                    print(f"  ... and {len(adapted_weights) - 20} more")
+                                print("=" * 80)
+
+                            drafter.load_weights(adapted_weights)
+
+                            # 🔥 DEBUG: Save loaded draft weights for comparison
+                            import time
+                            import os
+                            if self.local_rank == 0:  # Only save on local rank 0
+                                save_dir = "/home/t00972278/draft_weight_debug"
+                                os.makedirs(save_dir, exist_ok=True)
+                                timestamp = int(time.time())
+                                save_path = f"{save_dir}/loaded_step_{timestamp}.pt"
+                                # Collect ALL weights from drafter (no filtering)
+                                loaded_dict = {}
+                                print("=" * 80)
+                                print(f"🔥 DEBUG: Collecting drafter weights from {type(drafter).__name__}")
+                                for name, param in drafter.named_parameters():
+                                    loaded_dict[name] = param.detach().cpu()
+                                    print(f"  [param] {name:60s} shape={tuple(param.shape)}")
+                                for name, buf in drafter.named_buffers():
+                                    loaded_dict[name] = buf.detach().cpu()
+                                    print(f"  [buffer] {name:60s} shape={tuple(buf.shape)}")
+                                print(f"🔥 DEBUG: Total collected: {len(loaded_dict)} weights")
+                                print("=" * 80)
+                                torch.save(loaded_dict, save_path)
+                                logger.info(f"🔥 DEBUG: Saved loaded draft weights to {save_path}, total: {len(loaded_dict)}")
+
+                        logger.info(
+                            f"EAGLE3 weights routed: base_params={len(base_weights)}, draft_params={len(draft_weights)}"
+                        )
+                    else:
+                        # MTP or no drafter: all models get all weights
+                        for model in self._iter_all_models():
+                            model.load_weights(self._adapt_weight_names_for_model(model, param_updates))
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
                 logger.info(
                     f"Loading standard weights (non-FP8, async), "
@@ -640,6 +823,42 @@ def build_mtp_speculative_config(
         "num_speculative_tokens": num_speculative_tokens,
         **{key: val for key, val in engine_speculative_config.items() if val is not None},
     }
+
+
+def build_eagle3_speculative_config(
+    draft_model_path: str, num_speculative_tokens: int, engine_speculative_config: Any = None
+) -> dict[str, Any]:
+    """Build vLLM's EAGLE3 speculative config, applying rollout engine overrides.
+
+    Args:
+        draft_model_path: Path to the EAGLE3 draft model checkpoint
+        num_speculative_tokens: Number of speculative tokens to generate
+        engine_speculative_config: Optional engine-level speculative config overrides
+
+    Returns:
+        Dict with method, model, num_speculative_tokens, and any engine overrides
+    """
+    if engine_speculative_config is None:
+        engine_speculative_config = {}
+    if isinstance(engine_speculative_config, str):
+        engine_speculative_config = json.loads(engine_speculative_config)
+    if not isinstance(engine_speculative_config, Mapping):
+        raise TypeError("rollout.engine_kwargs.vllm.speculative_config must be a mapping when EAGLE3 rollout is enabled")
+
+    # CRITICAL FIX: Draft model must use 'auto' load_format, not inherit 'dummy' from main model.
+    # The main model uses 'dummy' because weights come from actor sync, but draft weights must
+    # be loaded from disk. Without this, draft_load_config defaults to None and inherits the
+    # main model's 'dummy' loader, which skips all weight loading, leaving draft_id_to_target_id
+    # and other parameters at their random-initialized values, causing acceptance rate ≈ 0.
+    config = {
+        "method": "eagle3",
+        "model": draft_model_path,
+        "num_speculative_tokens": num_speculative_tokens,
+        "draft_load_config": {"load_format": "auto"},  # Force draft to load from disk
+        **{key: val for key, val in engine_speculative_config.items() if val is not None},
+    }
+
+    return config
 
 
 def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):

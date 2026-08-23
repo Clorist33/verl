@@ -431,7 +431,8 @@ class FileLogger:
         self.fp = open(self.filepath, "wb", buffering=0)
 
     def log(self, data, step):
-        data = {"step": step, "data": data}
+        from datetime import datetime
+        data = {"step": step, "data": data, "timestamp": datetime.utcnow().isoformat() + "Z"}
         self.fp.write(orjson.dumps(data, option=orjson.OPT_SERIALIZE_NUMPY) + b"\n")
 
     def finish(self):

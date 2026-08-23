@@ -398,6 +398,21 @@ class SGLangHttpServer:
             args["enable_weights_cpu_backup"] = True
             args["enable_draft_weights_cpu_backup"] = True
 
+        # eagle3
+        if self.config.eagle3 is not None and self.config.eagle3.enable and self.config.eagle3.enable_rollout:
+            # Enable weights CPU backup for sglang >= 0.5.6
+            if version.parse(sglang.__version__) < version.parse("0.5.6"):
+                raise ValueError(f"sglang version {sglang.__version__} is not supported for EAGLE3 rollout")
+
+            args["speculative_algorithm"] = "EAGLE"
+            args["speculative_num_steps"] = 3
+            args["speculative_eagle_topk"] = 1
+            args["speculative_num_draft_tokens"] = self.config.eagle3.num_speculative_tokens
+            args["speculative_draft_model_path"] = self.config.eagle3.draft_model_path
+
+            args["enable_weights_cpu_backup"] = True
+            args["enable_draft_weights_cpu_backup"] = True
+
         # NOTE: We can't directly call SGLang's launch_server since it's not an async function.
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config

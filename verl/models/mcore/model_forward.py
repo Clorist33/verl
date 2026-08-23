@@ -272,6 +272,7 @@ def gptmodel_forward_model_engine(
     pad_token_id=None,
     data_format: str = "thd",
     mtp_enable_train: bool = False,
+    eagle3_enable_train: bool = False,
     local_cp_size: Optional[int] = None,
     forced_max_seqlen: Optional[int] = None,
 ):
@@ -298,7 +299,7 @@ def gptmodel_forward_model_engine(
     if data_format == "thd":
         input_ids_rmpad, packed_seq_params, position_ids_rmpad = preprocess_thd_engine(
             input_ids,
-            pre_process=pre_process or (post_process and mtp_enable_train),
+            pre_process=pre_process or (post_process and (mtp_enable_train or eagle3_enable_train)),
             use_fp8_padding=use_fp8_padding,
             local_cp_size=local_cp_size,
         )
@@ -328,6 +329,26 @@ def gptmodel_forward_model_engine(
 
             model_kwargs["labels"] = args["label"].contiguous()
             model_kwargs["loss_mask"] = args["loss_mask"].contiguous()
+
+        elif eagle3_enable_train and post_process:
+            # EAGLE3: the draft (inside the patched _postprocess) needs a per-position
+            # loss_mask aligned to the packed input_ids = [prompt; response]. Reuse MTP's
+            # expansion (response-only -> full length: prompt zeros + response positions),
+            # but pass NO labels (draft distills teacher logits, not CE-on-labels) and
+            # need_roll=False (loss_mcore.py applies its own left-shift for the teacher).
+            input_ids_offsets = input_ids.offsets()
+            input_ids_lengths = input_ids_offsets.diff().tolist()
+            response_attention_mask = logits_processor_args.get("response_attention_mask", None)
+            eagle3_loss_mask = _build_mtp_loss_mask_nested(
+                logits_processor_args["loss_mask"], input_ids_lengths, response_attention_mask
+            )
+            model_kwargs["loss_mask"] = preprocess_thd_engine(
+                eagle3_loss_mask,
+                pre_process=True,
+                need_roll=False,
+                use_fp8_padding=use_fp8_padding,
+                local_cp_size=local_cp_size,
+            )[0].contiguous()
 
         if logits_processor_args and "loss_mask" in logits_processor_args:
             logits_processor_args.pop("loss_mask")

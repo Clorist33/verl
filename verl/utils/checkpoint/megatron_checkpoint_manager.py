@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 from enum import Enum
 
@@ -997,22 +998,58 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                 extended_args[sig] = mbridge_config[sig]
         return extended_args
 
+    @contextmanager
+    def _eagle3_hide_draft_submodules(self):
+        """Context manager to temporarily hide EAGLE3 draft submodules during HF checkpoint save.
+
+        EAGLE3 draft is saved separately to its own HF path; we don't want it in the policy checkpoint.
+        """
+        # Check if model has eagle3 draft module
+        hidden_modules = []
+
+        # Handle both single model and list of models (PP > 1 case)
+        models_to_process = self.model if isinstance(self.model, list) else [self.model]
+
+        for model in models_to_process:
+            # Unwrap DDP/FSDP if needed
+            if hasattr(model, 'module'):
+                unwrapped_model = model.module
+            else:
+                unwrapped_model = model
+
+            # Skip if not a proper nn.Module (safety check)
+            if not hasattr(unwrapped_model, '_modules'):
+                continue
+
+            # Try to find and temporarily remove draft-related submodules
+            for name in list(unwrapped_model._modules.keys()):
+                if 'draft' in name.lower() or 'eagle3' in name.lower():
+                    hidden_modules.append((unwrapped_model, name, unwrapped_model._modules.pop(name)))
+
+        try:
+            yield
+        finally:
+            # Restore hidden modules
+            for unwrapped_model, name, module in hidden_modules:
+                unwrapped_model._modules[name] = module
+
     def _save_model_as_hf_via_bridge(self, hf_ckpt_path: str):
         """Save model weights through megatron-bridge."""
-        if self.vanilla_bridge:
-            self.bridge.save_weights(self.model, hf_ckpt_path, **self._get_bridge_extended_args())
-        else:
-            if self.peft_cls is not None:
-                hf_adapter_ckpt_path = os.path.join(hf_ckpt_path, "adapter")
-                self.bridge.save_hf_adapter(self.model, hf_adapter_ckpt_path, self.peft_cls)
-                log_with_rank(
-                    f"Saved HF PEFT adapter checkpoint to {hf_adapter_ckpt_path}",
-                    rank=self.rank,
-                    logger=logger,
-                    log_only_rank_0=True,
-                )
+        with self._eagle3_hide_draft_submodules():
+            if self.vanilla_bridge:
+                self.bridge.save_weights(self.model, hf_ckpt_path, **self._get_bridge_extended_args())
             else:
-                self.bridge.save_hf_weights(self.model, hf_ckpt_path)
+                if self.peft_cls is not None:
+                    hf_adapter_ckpt_path = os.path.join(hf_ckpt_path, "adapter")
+                    self.bridge.save_hf_adapter(self.model, hf_adapter_ckpt_path, self.peft_cls)
+                    log_with_rank(
+                        f"Saved HF PEFT adapter checkpoint to {hf_adapter_ckpt_path}",
+                        rank=self.rank,
+                        logger=logger,
+                        log_only_rank_0=True,
+                    )
+                else:
+                    self.bridge.save_hf_weights(self.model, hf_ckpt_path)
 
     def _save_hf_config_and_tokenizer(self, local_path: str):
         """Rank-0 saves HF config, tokenizer, and generation config."""

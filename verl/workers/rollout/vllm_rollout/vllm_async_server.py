@@ -22,6 +22,7 @@ from pprint import pprint
 from typing import Any, Callable, Optional
 
 import ray
+import torch.distributed as dist
 import vllm.entrypoints.cli.serve
 from packaging import version
 from ray.actor import ActorHandle
@@ -58,6 +59,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     SuppressSignalInThread,
     build_cli_args_from_config,
     build_mtp_speculative_config,
+    build_eagle3_speculative_config,
     extract_prompt_logprobs,
     get_vllm_max_lora_rank,
 )
@@ -254,6 +256,17 @@ class vLLMHttpServer:
         self._pd_prefill_engine_id = prefill_engine_id
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+        print("\n" + "🔥" * 50)
+        print("🔥 LAUNCH-SERVER: vLLM launch_server() called!")
+        print(f"🔥 model_config type: {type(self.model_config)}")
+        print(f"🔥 hasattr(model_config, 'eagle3'): {hasattr(self.model_config, 'eagle3')}")
+        if hasattr(self.model_config, 'eagle3'):
+            print(f"🔥 model_config.eagle3: {self.model_config.eagle3}")
+            if self.model_config.eagle3 is not None:
+                print(f"🔥   eagle3.enable: {getattr(self.model_config.eagle3, 'enable', 'NO_ATTR')}")
+                print(f"🔥   eagle3.enable_rollout: {getattr(self.model_config.eagle3, 'enable_rollout', 'NO_ATTR')}")
+        print("🔥" * 50 + "\n")
+
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
                 "non-master node should provide master_address, master_port and dp_rpc_port"
@@ -353,6 +366,47 @@ class vLLMHttpServer:
                 self.config.mtp.num_speculative_tokens,
                 args.get("speculative_config"),
             )
+
+        # DEBUG: Check model_config.eagle3 before condition
+        logger.warning("=" * 100)
+        logger.warning("DEBUG: Checking model_config.eagle3")
+        logger.warning("  model_config type: %s", type(self.model_config))
+        logger.warning("  hasattr(model_config, 'eagle3'): %s", hasattr(self.model_config, 'eagle3'))
+        if hasattr(self.model_config, 'eagle3'):
+            logger.warning("  model_config.eagle3: %s", self.model_config.eagle3)
+            if self.model_config.eagle3 is not None:
+                logger.warning("  model_config.eagle3.enable: %s", getattr(self.model_config.eagle3, 'enable', 'NO_ATTR'))
+                logger.warning("  model_config.eagle3.enable_rollout: %s", getattr(self.model_config.eagle3, 'enable_rollout', 'NO_ATTR'))
+        else:
+            logger.warning("  model_config does NOT have eagle3 attribute!")
+        logger.warning("=" * 100)
+
+        # print("\n" + "⚡" * 50)
+        # print("⚡ BEFORE EAGLE3 CHECK")
+        # print(f"⚡ self.model_config.eagle3: {getattr(self.model_config, 'eagle3', 'NO_ATTR')}")
+        # if hasattr(self.model_config, 'eagle3') and self.model_config.eagle3 is not None:
+        #     print(f"⚡   enable: {getattr(self.model_config.eagle3, 'enable', 'NO_ATTR')}")
+        #     print(f"⚡   enable_rollout: {getattr(self.model_config.eagle3, 'enable_rollout', 'NO_ATTR')}")
+        # print("⚡" * 50 + "\n")
+
+        if self.model_config.eagle3 is not None and self.model_config.eagle3.enable and self.model_config.eagle3.enable_rollout:
+            # print("\n" + "🚀" * 50)
+            # print("🚀 EAGLE3 CHECK PASSED! Building speculative_config...")
+            # print("🚀" * 50 + "\n")
+            # print("~" * 100)
+            # print("EAGLE3-ROLLOUT-INIT: Building EAGLE3 speculative_config for vLLM")
+            # print("  draft_model_path: %s", self.model_config.eagle3.draft_model_path)
+            # print("  num_speculative_tokens: %d", self.model_config.eagle3.num_speculative_tokens)
+            # print("~" * 100)
+            args["speculative_config"] = build_eagle3_speculative_config(
+                self.model_config.eagle3.draft_model_path,
+                self.model_config.eagle3.num_speculative_tokens,
+                args.get("speculative_config"),
+            )
+            print("~" * 100)
+            print("EAGLE3-ROLLOUT-INIT: speculative_config built successfully")
+            print("  speculative_config: %s", args["speculative_config"])
+            print("~" * 100)
 
         if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
@@ -464,6 +518,27 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        # EAGLE3: attach a custom StatLogger so spec-decode acceptance counters are
+        # accumulated in this (frontend) process and can be surfaced as a training
+        # metric. vLLM V1's per-request RequestStateStats has no spec-decode fields;
+        # the counts live in the global per-step scheduler_stats.spec_decoding_stats,
+        # which only a StatLogger can observe. Requires stats enabled (disable_log_stats
+        # =False keeps the default loggers too, since vLLM runs custom + default together).
+        eagle3_cfg = getattr(self.model_config, "eagle3", None)
+        if (
+            eagle3_cfg is not None
+            and getattr(eagle3_cfg, "enable", False)
+            and getattr(eagle3_cfg, "enable_rollout", False)
+            and "stat_loggers" in fn_args
+        ):
+            from verl.workers.rollout.vllm_rollout.spec_decode_metrics import make_spec_decode_stat_logger
+
+            spec_logger = make_spec_decode_stat_logger()
+            if spec_logger is not None:
+                kwargs["stat_loggers"] = [spec_logger]
+                if "disable_log_stats" in fn_args:
+                    kwargs["disable_log_stats"] = False
+
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
@@ -545,6 +620,15 @@ class vLLMHttpServer:
         Args:
             kv_transfer_params: vLLM KV-transfer payload for PD requests.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # print("\n" + "💥" * 50)
+        # print(f"💥 GENERATE: vLLM generate() called!")
+        # print(f"💥   request_id: {request_id}")
+        # print(f"💥   num_prompt_tokens: {len(prompt_ids)}")
+        # print(f"💥   model_config.eagle3: {getattr(self.model_config, 'eagle3', 'NO_ATTR')}")
+        # print("💥" * 50 + "\n")
         if self._disaggregation_role == "prefill" and self._pd_decode_peers and kv_transfer_params is None:
             return await self._pd_dispatch(
                 prompt_ids,
@@ -696,6 +780,9 @@ class vLLMHttpServer:
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             spec_decode_stats = getattr(final_res.metrics, "request_spec_decode_stats", None)
             if spec_decode_stats is None:
+                logger.warning("-" * 50)
+                logger.warning("DRAFT-ROLLOUT: WARNING - spec_decode_stats is None, draft NOT used in rollout")
+                logger.warning("-" * 50)
                 if not self._warned_missing_spec_decode_stats:
                     logger.warning(
                         "vLLM MTP rollout metrics do not include request_spec_decode_stats; "
@@ -703,9 +790,69 @@ class vLLMHttpServer:
                     )
                     self._warned_missing_spec_decode_stats = True
             else:
+                logger.warning("-" * 50)
+                logger.warning("DRAFT-ROLLOUT: vLLM returned spec_decode_stats, num_draft=%d, num_accepted=%d",
+                               spec_decode_stats.num_draft_tokens, spec_decode_stats.num_accepted_tokens)
+                logger.warning("-" * 50)
                 extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
                 extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
                 extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
+
+        # DEPRECATED (dead code): per-request EAGLE3 spec-decode extraction.
+        # vLLM V1's final_res.metrics is a RequestStateStats and has NO
+        # request_spec_decode_stats field, so this branch always saw None and
+        # never wrote extra_fields. Spec-decode acceptance is now collected via the
+        # global SpecDecodeStatLogger (spec_decode_metrics.py) and surfaced by
+        # LLMServerManager.collect_spec_decode_metrics(). Kept commented for reference.
+        # if self.model_config.eagle3 is not None and self.model_config.eagle3.enable and self.model_config.eagle3.enable_rollout:
+        #     spec_decode_stats = getattr(final_res.metrics, "request_spec_decode_stats", None) if final_res.metrics else None
+        #     if spec_decode_stats is None:
+        #         if not self._warned_missing_spec_decode_stats:
+        #             logger.warning(
+        #                 "vLLM EAGLE3 rollout metrics do not include request_spec_decode_stats; "
+        #                 "speculative decoding acceptance metrics will be skipped."
+        #             )
+        #             self._warned_missing_spec_decode_stats = True
+        #     else:
+        #         extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
+        #         extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
+        #         extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
+
+        # rank0打印生成后的信息
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print("\n" + "✅" * 50)
+            print(f"✅ GENERATE-RETURN: vLLM generate() returning response!")
+            print(f"✅   request_id: {request_id}")
+            print(f"✅   num_generated_tokens: {len(token_ids)}")
+            print(f"✅   stop_reason: {stop_reason}")
+            if self.model_config.eagle3 is not None and self.model_config.eagle3.enable and self.model_config.eagle3.enable_rollout:
+                # vLLM V1's per-request final_res.metrics (RequestStateStats) has NO
+                # spec-decode fields. The real counts are accumulated globally by the
+                # SpecDecodeStatLogger into the process-local _ACCUM (see
+                # spec_decode_metrics.py). Peek at it here WITHOUT resetting (read-only
+                # snapshot) so pop_spec_decode_metrics() still sees the full counts.
+                from verl.workers.rollout.vllm_rollout import spec_decode_metrics as _sdm
+
+                with _sdm._LOCK:
+                    _snap = dict(_sdm._ACCUM)
+                _draft = _snap.get("num_draft_tokens", 0)
+                _accepted = _snap.get("num_accepted_tokens", 0)
+                _drafts = _snap.get("num_drafts", 0)
+                if _draft > 0:
+                    _rate = _accepted / _draft
+                    _mean_len = 1.0 + (_accepted / _drafts if _drafts > 0 else 0.0)
+                    print(f"✅   EAGLE3 num_drafts (cumulative): {_drafts}")
+                    print(f"✅   EAGLE3 num_draft_tokens (cumulative): {_draft}")
+                    print(f"✅   EAGLE3 num_accepted_tokens (cumulative): {_accepted}")
+                    print(f"✅   EAGLE3 acceptance_rate: {_rate:.4f}")
+                    print(f"✅   EAGLE3 mean_acceptance_length: {_mean_len:.4f}")
+                else:
+                    print("✅   EAGLE3 spec-decode accumulator empty so far (no drafts observed yet)")
+            print("✅" * 50 + "\n")
+
+        # FORCE-STOP: 生成一个 response 后停止训练
+        # raise RuntimeError("FORCE-STOP: Generated one response, stopping training for debug!")
+
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
@@ -871,6 +1018,40 @@ class vLLMHttpServer:
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
+    async def pop_spec_decode_metrics(self) -> dict[str, int]:
+        """Return + reset this server's accumulated EAGLE3 spec-decode counters.
+
+        Counts are accumulated by the SpecDecodeStatLogger in this process. Returns
+        zeros if spec decode / the logger is not active.
+        """
+        try:
+            from verl.workers.rollout.vllm_rollout.spec_decode_metrics import pop_spec_decode_accumulator
+
+            return pop_spec_decode_accumulator()
+        except Exception:
+            return {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0}
+
+    async def pop_policy_verify_timing(self) -> dict[str, float]:
+        """Return + reset accumulated EAGLE3 policy-verify timing across this server's
+        TP workers.
+
+        Timing is accumulated per verify step in each rollout WORKER process
+        (vllm_ascend model_runner), so unlike spec-decode stats (server process) it
+        must be pulled via collective_rpc. Sums the per-worker sums and counts.
+        """
+        try:
+            per_worker = await self.engine.collective_rpc(method="pop_policy_verify_timing")
+        except Exception:
+            return {"policy_forward_ms_sum": 0.0, "policy_forward_rejection_ms_sum": 0.0, "n": 0}
+        agg = {"policy_forward_ms_sum": 0.0, "policy_forward_rejection_ms_sum": 0.0, "n": 0}
+        for d in per_worker or []:
+            if not d:
+                continue
+            agg["policy_forward_ms_sum"] += float(d.get("policy_forward_ms_sum", 0.0) or 0.0)
+            agg["policy_forward_rejection_ms_sum"] += float(d.get("policy_forward_rejection_ms_sum", 0.0) or 0.0)
+            agg["n"] += int(d.get("n", 0) or 0)
+        return agg
+
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.
 
@@ -1033,6 +1214,19 @@ class vLLMHttpServer:
             # Work around multimodal processor cache desync across pause/resume.
             # See: https://github.com/vllm-project/vllm/pull/43001/
             engine_kwargs.setdefault("mm_processor_cache_gb", 0)
+
+        # Force enable metrics collection for EAGLE3 spec_decode_stats
+        print("\n" + "🔧" * 50)
+        print("🔧 _preprocess_engine_kwargs: Forcing disable_log_stats=False for metrics collection")
+        print(f"🔧   Before: disable_log_stats = {engine_kwargs.get('disable_log_stats', 'NOT_SET')}")
+        print("🔧" * 50 + "\n")
+
+        engine_kwargs["disable_log_stats"] = False
+
+        print("\n" + "✅" * 50)
+        print("✅ _preprocess_engine_kwargs: Metrics collection enabled")
+        print(f"✅   After: disable_log_stats = {engine_kwargs['disable_log_stats']}")
+        print("✅" * 50 + "\n")
 
     def _get_override_generation_config(self) -> dict:
         """Return the override_generation_config dict."""
@@ -1283,6 +1477,34 @@ class vLLMReplica(RolloutReplica):
     async def resume_generation(self):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
+
+    async def pop_spec_decode_metrics(self) -> dict[str, int]:
+        """Aggregate + reset EAGLE3 spec-decode counters across this replica's servers."""
+        per_server = await asyncio.gather(
+            *[server.pop_spec_decode_metrics.remote() for server in self.servers]
+        )
+        agg = {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0}
+        for d in per_server:
+            if not d:
+                continue
+            agg["num_drafts"] += int(d.get("num_drafts", 0) or 0)
+            agg["num_draft_tokens"] += int(d.get("num_draft_tokens", 0) or 0)
+            agg["num_accepted_tokens"] += int(d.get("num_accepted_tokens", 0) or 0)
+        return agg
+
+    async def pop_policy_verify_timing(self) -> dict[str, float]:
+        """Aggregate + reset EAGLE3 policy-verify timing across this replica's servers."""
+        per_server = await asyncio.gather(
+            *[server.pop_policy_verify_timing.remote() for server in self.servers]
+        )
+        agg = {"policy_forward_ms_sum": 0.0, "policy_forward_rejection_ms_sum": 0.0, "n": 0}
+        for d in per_server:
+            if not d:
+                continue
+            agg["policy_forward_ms_sum"] += float(d.get("policy_forward_ms_sum", 0.0) or 0.0)
+            agg["policy_forward_rejection_ms_sum"] += float(d.get("policy_forward_rejection_ms_sum", 0.0) or 0.0)
+            agg["n"] += int(d.get("n", 0) or 0)
+        return agg
 
     async def abort_request(self, request_id: str) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.

@@ -20,7 +20,7 @@ from omegaconf import MISSING, DictConfig, OmegaConf
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 from verl.workers.config.disaggregation import DisaggregationConfig
-from verl.workers.config.model import MtpConfig
+from verl.workers.config.model import MtpConfig, Eagle3Config
 
 __all__ = [
     "SamplingConfig",
@@ -268,6 +268,8 @@ class RolloutConfig(BaseConfig):
     enable_sleep_mode: bool = True
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
+
+    eagle3: Eagle3Config = field(default_factory=Eagle3Config)
 
     qat: Optional[dict] = None
 

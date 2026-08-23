@@ -688,6 +688,96 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     }
 
 
+def compute_spec_decode_metrics(
+    spec_drafts,
+    spec_accepts,
+    spec_verifies,
+    non_padding_mask=None,
+) -> dict[str, Any]:
+    """Aggregate per-request speculative-decoding stats (EAGLE3 / MTP rollout).
+
+    Produces the draft-side acceptance metrics:
+      - ``rollout/spec_accept_rate``   : accepted / drafted tokens, per request then averaged
+      - ``rollout/spec_accept_length`` : acceptance length tau = 1 + accepted / verify_steps
+
+    Ratios are computed per request and then averaged, so long and short responses
+    have equal metric weight. The three inputs come from the rollout engine (vLLM
+    request spec-decode stats or sglang ``meta_info["spec_*"]`` keys). Either all
+    three are ``None`` (caller didn't fetch them, e.g. spec rollout disabled) and the
+    function is a no-op, or all three are populated; mixed state is a programmer error.
+
+    ``non_padding_mask`` is a numpy bool array used by sync PPO to drop padded
+    placeholder samples; pass ``None`` for async PPO.
+    """
+    if spec_drafts is None and spec_accepts is None and spec_verifies is None:
+        return {}
+    assert spec_drafts is not None and spec_accepts is not None and spec_verifies is not None, (
+        "spec_decode metrics require all three of spec_num_draft_tokens / "
+        "spec_num_accepted_tokens / spec_num_verify_steps; got partial inputs"
+    )
+
+    drafts = spec_drafts.tolist() if hasattr(spec_drafts, "tolist") else list(spec_drafts)
+    accepts = spec_accepts.tolist() if hasattr(spec_accepts, "tolist") else list(spec_accepts)
+    verifies = spec_verifies.tolist() if hasattr(spec_verifies, "tolist") else list(spec_verifies)
+
+    if non_padding_mask is not None:
+        drafts = [d for d, keep in zip(drafts, non_padding_mask, strict=True) if keep]
+        accepts = [a for a, keep in zip(accepts, non_padding_mask, strict=True) if keep]
+        verifies = [v for v, keep in zip(verifies, non_padding_mask, strict=True) if keep]
+
+    if len(drafts) == 0:
+        return {}
+
+    # Treat zero-denominator samples as 0.0 and keep them in the mean.
+    per_sample_accept_rate = [(a / d) if d > 0 else 0.0 for a, d in zip(accepts, drafts, strict=True)]
+    per_sample_accept_length = [(1.0 + a / v) if v > 0 else 0.0 for a, v in zip(accepts, verifies, strict=True)]
+
+    n = len(drafts)
+    return {
+        "rollout/spec_accept_rate": float(sum(per_sample_accept_rate) / n),
+        "rollout/spec_accept_length": float(sum(per_sample_accept_length) / n),
+    }
+
+
+def compute_draft_metrics(
+    metrics: dict[str, Any] | None = None,
+    spec_drafts=None,
+    spec_accepts=None,
+    spec_verifies=None,
+    non_padding_mask=None,
+) -> dict[str, Any]:
+    """Consolidated EAGLE3 draft-side metrics under one ``eagle3/`` namespace.
+
+    Groups the two draft-side numbers tracked for EAGLE3 so a dashboard can read them
+    from a single prefix instead of two unrelated ones:
+      - ``eagle3/draft_loss``         : draft distillation loss. The engine already
+        surfaces this per-step as ``actor/draft_loss`` (megatron transformer_impl's
+        ``eagle3_backward_step``); this mirrors it into the eagle3 group.
+      - ``eagle3/spec_accept_length`` : acceptance length tau (EAGLE3's core quality
+        number), rollout-only.
+      - ``eagle3/spec_accept_rate``   : per-draft-token acceptance, rollout-only.
+
+    Source-gated and non-invasive: emits ``draft_loss`` only when the engine logged it
+    this step (draft training on), and the accept_* keys only when spec rollout wrote
+    stats. Returns ``{}`` for a pure policy run. Does NOT remove the original
+    ``actor/draft_loss`` / ``rollout/spec_*`` keys -- it adds a grouped view alongside them.
+    """
+    out: dict[str, Any] = {}
+    draft_loss = metrics.get("actor/draft_loss") if metrics else None
+    if draft_loss is not None:
+        out["eagle3/draft_loss"] = float(draft_loss)
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning("-" * 50)
+        logger.warning("DRAFT-METRIC: draft_loss in final metrics = %f", draft_loss)
+        logger.warning("-" * 50)
+    spec = compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask)
+    if "rollout/spec_accept_length" in spec:
+        out["eagle3/spec_accept_length"] = spec["rollout/spec_accept_length"]
+        out["eagle3/spec_accept_rate"] = spec["rollout/spec_accept_rate"]
+    return out
+
+
 def compute_variance_proxy_metrics(batch: DataProto, gradient_norm: float = None) -> dict[str, float]:
     """
     Compute variance proxy metrics using the simplified expected squared norm approach.

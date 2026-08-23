@@ -29,6 +29,9 @@ virtual_pipeline_model_parallel_size: null
 context_parallel_size: 1
 
 # sequence parallel
+# [DEPRECATED 2026-08-11] 旧值 False：EAGLE3 曾要求关 SP 做 hidden capture。
+# 现已放开：eagle3_patch._postprocess 会 gather SP 切片回完整序列；且 MoE+TP>1 必须开 SP。
+# sequence_parallel: False
 sequence_parallel: True
 
 # Whether to use distributed optimizer
@@ -74,7 +77,8 @@ override_transformer_config:
   # Recompute configuration, same as in megatron.training.arguments
   # default use minimal performance-interference recompute methods
   # Recompute granualarity, choices: ["full", "selective"]
-  recompute_granularity: null
+  # recompute_granularity: selective  # NPU 崩溃：aicore timeout in ZerosLike, 错误码 507014
+  recompute_granularity: null  # 回滚：不重计算，用降 batch 的方式腾显存
 
   # Recompute modules, multiple choices: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe"]
   # Please use correct module in matched model

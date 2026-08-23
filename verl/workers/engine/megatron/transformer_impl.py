@@ -53,6 +53,7 @@ from verl.utils.megatron.tensor_parallel import (
 from verl.utils.megatron_peft_utils import build_peft_config_for_vllm
 from verl.utils.megatron_utils import (
     check_mtp_config,
+    get_device_id,
     get_megatron_module_device,
     get_megatron_mtp_loss,
     load_megatron_model_to_gpu,
@@ -99,6 +100,9 @@ class MegatronEngine(BaseEngine):
         self._is_offload_optimizer = self.engine_config.optimizer_offload
 
         self.mode = None
+
+        # EAGLE3 draft training state (None when disabled); see verl/models/eagle3/engine_support.py
+        self._eagle3 = None
 
         self.layer_name_mapping = {
             "qkv_layer_name": "self_attention.linear_qkv.",
@@ -449,6 +453,20 @@ class MegatronEngine(BaseEngine):
         self.optimizer = self._build_optimizer()
         self.lr_scheduler = self._build_lr_scheduler()
 
+        # EAGLE3 draft training: build self-written draft + independent optimizer +
+        # hidden capture + _postprocess patch (PP=1 gate enforced inside).
+        _e3 = getattr(self.model_config, "eagle3", None)
+        logger.warning(
+            "EAGLE3-DIAG[init]: forward_only=%s eagle3_is_none=%s enable_train=%s enable_rollout=%s draft_path=%r",
+            self.engine_config.forward_only, _e3 is None,
+            getattr(_e3, "enable_train", "N/A"), getattr(_e3, "enable_rollout", "N/A"),
+            getattr(_e3, "draft_model_path", "N/A"),
+        )
+        if _e3 is not None and _e3.enable_train:
+            from verl.models.eagle3.engine_support import setup_eagle3_training
+
+            self._eagle3 = setup_eagle3_training(self, self.module)
+
         full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
         mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
 
@@ -631,6 +649,9 @@ class MegatronEngine(BaseEngine):
         self.checkpoint_mananager.save_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
+        # EAGLE3: persist the trained draft (module + optimizer) alongside the policy
+        # checkpoint via its own per-rank shard (the draft is not a policy submodule).
+        self._save_eagle3_draft(local_path)
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
@@ -651,10 +672,96 @@ class MegatronEngine(BaseEngine):
         self.checkpoint_mananager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
+        # EAGLE3: restore the trained draft (module + optimizer) from its own per-rank
+        # shard, if present. Runs AFTER setup_eagle3_training has built+HF-initialized
+        # the draft, so this overrides the HF init with the resumed training state.
+        self._load_eagle3_draft(local_path)
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.module)
         if self._is_offload_optimizer:
             offload_megatron_optimizer(self.optimizer)
+
+    @staticmethod
+    def _eagle3_draft_ckpt_dir(local_path: str) -> str:
+        return os.path.join(local_path, "eagle3_draft")
+
+    def _save_eagle3_draft(self, local_path: str) -> None:
+        """Save the EAGLE3 draft module + its independent optimizer as a per-rank
+        shard (method-1). Each rank writes its own TP shard to
+        ``{local_path}/eagle3_draft/draft_rank{rank}.pt``; resuming therefore
+        requires the SAME parallel layout (world size / TP / DP / EP unchanged),
+        which is the agreed contract. The draft is small (~tens of MB/rank), so the
+        cross-DP redundancy is negligible. The draft is NOT a policy submodule, so
+        it is invisible to the policy's dist-ckpt / HF-bridge save paths -- this is
+        the only place its trained state is persisted."""
+        state = getattr(self, "_eagle3", None)
+        if state is None or not state.enabled:
+            return
+        from verl.models.eagle3.engine_support import unwrap_draft
+
+        draft = unwrap_draft(state.draft_raw if state.draft_raw is not None else state.draft_module)
+        ckpt_dir = self._eagle3_draft_ckpt_dir(local_path)
+        os.makedirs(ckpt_dir, exist_ok=True)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+        # DIAGNOSTIC: Check draft.state_dict() for None values
+        draft_sd = draft.state_dict()
+        logger.warning(f"EAGLE3-DEBUG [Rank {rank}]: draft.state_dict() has {len(draft_sd)} keys")
+        none_keys = []
+        for k, v in draft_sd.items():
+            if v is None:
+                logger.error(f"EAGLE3-ERROR [Rank {rank}]: parameter '{k}' is None!")
+                none_keys.append(k)
+            elif not isinstance(v, torch.Tensor):
+                logger.warning(f"EAGLE3-WARNING [Rank {rank}]: parameter '{k}' is not a Tensor (type={type(v)})")
+
+        if none_keys:
+            logger.error(f"EAGLE3-ERROR [Rank {rank}]: Found {len(none_keys)} None parameters: {none_keys}")
+
+        # Filter out None values to avoid detach() error
+        draft_state = {k: v.detach().to("cpu") for k, v in draft_sd.items() if v is not None and isinstance(v, torch.Tensor)}
+        logger.warning(f"EAGLE3-DEBUG [Rank {rank}]: After filtering, {len(draft_state)} valid parameters to save")
+
+        payload = {
+            "draft": draft_state,
+            "optimizer": state.draft_optimizer.state_dict() if state.draft_optimizer is not None else None,
+            "world_size": world,
+        }
+        torch.save(payload, os.path.join(ckpt_dir, f"draft_rank{rank}.pt"))
+        if rank == 0:
+            logger.info("EAGLE3: saved draft shard(s) to %s", ckpt_dir)
+
+    def _load_eagle3_draft(self, local_path: str) -> None:
+        """Restore the draft module + optimizer from the per-rank shard written by
+        ``_save_eagle3_draft``. Missing dir/file -> first run (draft keeps its HF
+        init), skip silently. A world-size mismatch means the layout changed since
+        the shard was written, which method-1 cannot re-shard -> fail loudly."""
+        state = getattr(self, "_eagle3", None)
+        if state is None or not state.enabled:
+            return
+        ckpt_dir = self._eagle3_draft_ckpt_dir(local_path)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        path = os.path.join(ckpt_dir, f"draft_rank{rank}.pt")
+        if not os.path.isfile(path):
+            return
+        from verl.models.eagle3.engine_support import unwrap_draft
+
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        saved_world = payload.get("world_size", world)
+        if saved_world != world:
+            raise ValueError(
+                f"EAGLE3 draft checkpoint was saved with world_size={saved_world} but the current "
+                f"run has world_size={world}. Per-rank draft shards (method-1) require an identical "
+                f"parallel layout to resume; re-launch with the same TP/DP/EP/world size."
+            )
+        draft = unwrap_draft(state.draft_raw if state.draft_raw is not None else state.draft_module)
+        draft.load_state_dict(payload["draft"], strict=False)
+        if payload.get("optimizer") is not None and state.draft_optimizer is not None:
+            state.draft_optimizer.load_state_dict(payload["optimizer"])
+        if rank == 0:
+            logger.info("EAGLE3: restored draft shard(s) from %s", ckpt_dir)
 
     def _routed_num_tokens(self, data: TensorDict) -> torch.Tensor:
         """Real (unpadded) tokens fed to the MoE router: attention_mask in the padded RL
@@ -768,6 +875,22 @@ class MegatronEngine(BaseEngine):
             forward_only=forward_only,
         )
 
+        # EAGLE3: backward the stashed L_draft + step the independent draft optimizer.
+        # Runs only during real training (not forward_only); draft graph is rooted at
+        # the detached aux hidden, so it is independent of the policy backward above.
+        if not forward_only and getattr(self, "_eagle3", None) is not None and self._eagle3.enabled:
+            from verl.models.eagle3.engine_support import eagle3_backward_step
+
+            draft_loss_val = eagle3_backward_step(self)
+            if draft_loss_val is not None and mpu.is_pipeline_last_stage(ignore_virtual=True):
+                if losses_reduced and self.is_mp_src_rank_with_outputs():
+                    if "metrics" not in losses_reduced[0]:
+                        losses_reduced[0]["metrics"] = {}
+                    losses_reduced[0]["metrics"]["draft_loss"] = draft_loss_val
+                    logger.warning("-" * 50)
+                    logger.warning("DRAFT-METRIC: draft_loss written to metrics = %f", draft_loss_val)
+                    logger.warning("-" * 50)
+
         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
             # because save_loss_to_tracker uses avg_group=DP+CP group.
@@ -811,9 +934,13 @@ class MegatronEngine(BaseEngine):
         peft_config = None
         non_merge_lora_sync = self.peft_cls is not None and not self.model_config.lora.get("merge", False)
         adapter_only = base_sync_done and non_merge_lora_sync
+
+        logger.warning(f"🔥 get_per_tensor_param: base_sync_done={base_sync_done}, non_merge_lora_sync={non_merge_lora_sync}, adapter_only={adapter_only}")
+
         if non_merge_lora_sync:
             peft_config = build_peft_config_for_vllm(self.model_config.lora)
         # when lora adapter only, we only load adapter weights when base sync is done, otherwise load all weights
+        logger.warning(f"🔥 Calling load_megatron_model_to_gpu with load_frozen_params={not adapter_only}")
         load_megatron_model_to_gpu(self.module, load_grad=False, load_frozen_params=not adapter_only)
         if self.vanilla_bridge:
             per_tensor_param = self.bridge.export_weights(self.module)
@@ -831,6 +958,43 @@ class MegatronEngine(BaseEngine):
             from verl.utils.modelopt import export_qat_weights
 
             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
+
+        # EAGLE3: when the rollout engine hosts a drafter (enable_rollout=True),
+        # append the trained draft to the policy weight stream with a `draft.`
+        # prefix. The draft is NOT a policy submodule (it is held via a list wrapper
+        # in eagle3_patch to keep it out of named_parameters()), so the base export
+        # above never walks it and no detach/restore guard is needed.
+        if getattr(self, "_eagle3", None) is not None and self._eagle3.enabled:
+            eagle3_cfg = getattr(self.model_config, "eagle3", None)
+            if eagle3_cfg is not None and eagle3_cfg.enable_rollout:
+                from itertools import chain
+
+                from verl.models.eagle3.engine_support import export_draft_weights, unwrap_draft
+
+                logger.warning("-" * 50)
+                logger.warning("DRAFT-TRAIN: exporting draft weights to vLLM, eagle3.enabled=%s, enable_rollout=%s",
+                               self._eagle3.enabled, eagle3_cfg.enable_rollout)
+                logger.warning("-" * 50)
+
+                # 🔥 FIX: When adapter_only=True (base_sync_done=True), load_frozen_params=False
+                # causes frozen draft parameters to stay on CPU. Force load them before export.
+                if adapter_only:
+                    logger.warning("🔥 adapter_only=True: force loading draft params to GPU before export")
+                    draft = unwrap_draft(self._eagle3.draft_module)
+                    device_id = get_device_id()
+                    for name, param in draft.named_parameters():
+                        if param.device.type == "cpu":
+                            logger.warning(f"   Loading draft param to GPU: {name}, shape={tuple(param.shape)}")
+                            param.data = param.data.to(device_id, non_blocking=True)
+                    # Also load buffers (t2d, d2t)
+                    for name, buf in draft.named_buffers():
+                        if buf.device.type == "cpu":
+                            logger.warning(f"   Loading draft buffer to GPU: {name}, shape={tuple(buf.shape)}")
+                            buf.data = buf.data.to(device_id, non_blocking=True)
+
+                per_tensor_param = chain(
+                    per_tensor_param, export_draft_weights(self._eagle3, dtype=self.param_dtype)
+                )
 
         return per_tensor_param, peft_config
 
@@ -1089,6 +1253,10 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 pad_token_id=self.model_config.tokenizer.pad_token_id,
                 data_format=data_format,
                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
+                eagle3_enable_train=(
+                    getattr(self.model_config, "eagle3", None) is not None
+                    and self.model_config.eagle3.enable_train
+                ),
                 local_cp_size=local_cp_size,
                 forced_max_seqlen=tu.get_non_tensor_data(data=batch, key="forced_max_seqlen", default=None),
             )

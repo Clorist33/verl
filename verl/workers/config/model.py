@@ -23,7 +23,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-__all__ = ["HFModelConfig", "MtpConfig"]
+__all__ = ["HFModelConfig", "MtpConfig", "Eagle3Config"]
 
 
 @dataclass
@@ -68,6 +68,126 @@ class MtpConfig(BaseConfig):
 
 
 @dataclass
+class Eagle3Config(BaseConfig):
+    """EAGLE3 online speculative-decoding / draft-model training config.
+
+    4.0: Megatron training backend + draft-independent optimizer + optional
+    vocab compression. See eagle3_开发方案设计4.0.html section 3 for field docs.
+    """
+
+    _mutable_fields = {"enable"}
+
+    # ---- main switches ----
+    enable: bool = False
+    enable_train: bool = False
+    enable_rollout: bool = False
+    draft_model_path: str = ""
+    loss_weight: float = 1.0
+    # empty -> auto-detect from draft ckpt; runtime fallback formula (2, N//2, N-3)
+    capture_layer_ids: list[int] = field(default_factory=list)
+    method: str = "eagle3"
+    num_speculative_tokens: int = 3
+
+    # ---- draft independent optimizer hyperparams ----
+    draft_optim_lr: float = 1e-4
+    draft_optim_weight_decay: float = 0.01
+    draft_optim_clip_grad: float = 1.0
+    draft_optim_offload: bool = False
+    # Activation-checkpoint the draft backbone (time-for-memory). Default False =
+    # unchanged behavior. Set True to cut draft-path activation peak (P5-09).
+    draft_forward_checkpoint: bool = False
+
+    # ---- vocab compression switch ----
+    enable_vocab_compression: bool = False
+    draft_vocab_size: int = 0
+    vocab_mapping_path: str = ""
+
+    # ---- 4.0 Megatron backend ----
+    backend: str = "megatron"  # training backend (this version fixes megatron)
+    ttt_length: int = 1  # TTT unroll steps (1 = off; >1 = autoregressive)
+    draft_pipeline_stage: str = "last"  # which PP stage hosts draft
+    allow_pp_gt_1: bool = False  # first version gate: only PP=1 supported
+
+    # ---- draft implementation choice ----
+    use_megatron_draft: bool = False  # True = MegatronModule + TP support; False = nn.Module + DDP (default)
+    # When True, draft uses TransformerBlock and supports TP cutting (saves ~2.2GB/card with TP=4)
+    # When False, draft uses plain nn.Module (current stable implementation, no TP)
+    # Draft TP degree (only used when use_megatron_draft=True). 0 = auto: follow policy TP,
+    # capped down to a divisor of num_query_groups (QKV-fusion constraint). A smaller
+    # explicit divisor builds a dedicated draft TP sub-group (PP=1/CP=1 only; Step 7 HW-pending).
+    draft_tensor_parallel_size: int = 0
+
+    def __post_init__(self):
+        # Auto-derive enable from sub-switches to prevent footguns
+        if self.enable_train or self.enable_rollout:
+            self.enable = True
+
+        # ---- rollout (generation-side) constraints (ported from 3.0) ----
+        if self.enable_rollout and not self.draft_model_path:
+            raise ValueError(
+                "Eagle3Config: draft_model_path must be set when enable_rollout=True. "
+                "EAGLE3 requires an external draft model checkpoint."
+            )
+        if self.enable_rollout and self.num_speculative_tokens <= 0:
+            raise ValueError(
+                f"Eagle3Config: num_speculative_tokens must be positive when enable_rollout=True, "
+                f"got {self.num_speculative_tokens}"
+            )
+        if self.capture_layer_ids and len(self.capture_layer_ids) != 3:
+            raise ValueError(
+                f"Eagle3Config: capture_layer_ids must contain exactly 3 layer indices when specified, "
+                f"got {len(self.capture_layer_ids)} indices: {self.capture_layer_ids}. "
+                "Leave empty to auto-detect from the draft checkpoint."
+            )
+        if self.capture_layer_ids and any(i < 0 for i in self.capture_layer_ids):
+            raise ValueError(
+                f"Eagle3Config: capture_layer_ids must be non-negative, got {self.capture_layer_ids}"
+            )
+        if self.loss_weight < 0:
+            raise ValueError(f"Eagle3Config: loss_weight must be non-negative, got {self.loss_weight}")
+
+        # ---- 4.0 training-side (Megatron) constraints ----
+        if self.backend not in ("megatron", "fsdp"):
+            raise ValueError(f"Eagle3Config: backend must be 'megatron' or 'fsdp', got {self.backend!r}")
+        if self.enable_train and self.backend != "megatron":
+            raise ValueError(
+                f"Eagle3Config: this version only implements the Megatron training backend, "
+                f"got backend={self.backend!r}. Set backend='megatron' to train the draft."
+            )
+        if self.ttt_length < 1:
+            raise ValueError(f"Eagle3Config: ttt_length must be >= 1 (1 disables TTT), got {self.ttt_length}")
+        if self.draft_pipeline_stage != "last":
+            # allow explicit non-negative integer stage index, otherwise reject
+            if not (self.draft_pipeline_stage.lstrip("-").isdigit() and int(self.draft_pipeline_stage) >= 0):
+                raise ValueError(
+                    f"Eagle3Config: draft_pipeline_stage must be 'last' or a non-negative int string, "
+                    f"got {self.draft_pipeline_stage!r}"
+                )
+
+        # draft independent optimizer hyperparams
+        if self.enable_train:
+            if self.draft_optim_lr <= 0:
+                raise ValueError(f"Eagle3Config: draft_optim_lr must be positive, got {self.draft_optim_lr}")
+            if self.draft_optim_weight_decay < 0:
+                raise ValueError(
+                    f"Eagle3Config: draft_optim_weight_decay must be non-negative, got {self.draft_optim_weight_decay}"
+                )
+            if self.draft_optim_clip_grad < 0:
+                raise ValueError(
+                    f"Eagle3Config: draft_optim_clip_grad must be non-negative, got {self.draft_optim_clip_grad}"
+                )
+
+        # vocab compression switch
+        if self.enable_vocab_compression and self.draft_vocab_size <= 0:
+            raise ValueError(
+                f"Eagle3Config: draft_vocab_size must be positive when enable_vocab_compression=True, "
+                f"got {self.draft_vocab_size}"
+            )
+        # NOTE: PP>1 vs allow_pp_gt_1 gate needs the Megatron parallel size, which is
+        # not visible here; it is enforced at engine initialize() (P2). See design 3.④.
+
+
+@dataclass
 class HFModelConfig(BaseConfig):
     # note that we separate model_path, model_config_path and tokenizer_path in case they are different
     _mutable_fields = {
@@ -83,6 +203,7 @@ class HFModelConfig(BaseConfig):
         "local_hf_config_path",
         "local_tokenizer_path",
         "mtp",
+        "eagle3",
     }
 
     path: str = MISSING
@@ -144,6 +265,7 @@ class HFModelConfig(BaseConfig):
     architectures: Optional[list[str]] = None
 
     mtp: MtpConfig = field(default_factory=MtpConfig)
+    eagle3: Eagle3Config = field(default_factory=Eagle3Config)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
@@ -242,6 +364,15 @@ class HFModelConfig(BaseConfig):
                 self.hf_config.mtp_num_hidden_layers = 0
             if hasattr(self.hf_config, "text_config") and hasattr(self.hf_config.text_config, "mtp_num_hidden_layers"):
                 self.hf_config.text_config.mtp_num_hidden_layers = 0
+
+        # EAGLE3 and MTP both patch GPTModel._postprocess during training; they cannot
+        # be enabled together. See eagle3_开发方案设计4.0.html section 3 (__post_init__ rule ④).
+        if self.eagle3.enable_train and self.mtp.enable:
+            raise ValueError(
+                "EAGLE3 draft training (model.eagle3.enable_train=True) is mutually exclusive "
+                "with MTP (model.mtp.enable=True): both patch GPTModel._postprocess. "
+                "Disable one of them."
+            )
 
         # Ensure target_modules is a str or list[str] (only if not None)
         if self.target_modules is not None:

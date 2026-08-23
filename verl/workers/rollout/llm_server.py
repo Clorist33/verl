@@ -589,3 +589,71 @@ class LLMServerManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+    @auto_await
+    async def collect_spec_decode_metrics(self) -> dict[str, float]:
+        """Aggregate EAGLE3 spec-decode acceptance across all replicas (since last call).
+
+        Returns a metrics dict with 4 keys 
+        ``rollout/acceptance_rate``,            # num_accepted_tokens/num_draft_tokens
+        ``rollout/mean_acceptance_length``,    # 包含bonus token, 公式=1+ num_accepted_tokens/进行投机解码的次数
+        ``rollout/num_draft_tokens  ``,         # 所有draft预测的token总数，这里的所有怎么理解？？？
+        ``rollout/num_accepted_tokens``.        # 被policy model接受的draft token总数
+        Empty dict if there were no drafts
+        (spec decode disabled / no rollout since last call).
+        """
+        per_replica = await asyncio.gather(
+            *[replica.pop_spec_decode_metrics() for replica in self.rollout_replicas]
+        )  # per_replica 的长度 = replica 的数量
+        drafts = draft_tokens = accepted = 0
+        for d in per_replica:  # per_replica代表的是一个replica（推理服务实例），个 replica 占用若干 GPU，加载完整模型，一个replica内会处理多个request，也就是会接受多条prompt并生成对应回复。一个 replica 并行工作，提高系统吞吐量。
+            if not d:
+                continue
+            drafts += int(d.get("num_drafts", 0) or 0)    # 单个replica内的darft前向次数（等于policy验证次数）
+            draft_tokens += int(d.get("num_draft_tokens", 0) or 0)  # 单个replica内的darft token生成的总数
+            accepted += int(d.get("num_accepted_tokens", 0) or 0)   # 单个replica内的darft token接受的总数
+        if draft_tokens == 0 and drafts == 0:
+            return {}
+        metrics = {
+            "rollout/num_draft_tokens": float(draft_tokens),
+            "rollout/num_accepted_tokens": float(accepted),
+        }
+        if draft_tokens > 0:
+            metrics["rollout/acceptance_rate"] = accepted / draft_tokens
+        if drafts > 0:
+            metrics["rollout/mean_acceptance_length"] = 1.0 + accepted / drafts
+
+
+        return metrics
+
+    @auto_await
+    async def collect_policy_verify_timing(self) -> dict[str, float]:
+        """Aggregate EAGLE3 policy-verify timing across all replicas (since last call).
+
+        Timing accumulated per verify step in each rollout worker process (vllm_ascend
+        model_runner), pulled via collective_rpc. Returns 4 keys:
+          rollout/policy_forward_ms_mean            = Σforward_sum / Σn
+          rollout/policy_forward_ms_total           = Σforward_sum
+          rollout/policy_forward_rejection_ms_mean  = Σ(forward+rejection)_sum / Σn
+          rollout/policy_forward_rejection_ms_total = Σ(forward+rejection)_sum
+        Empty dict if no verify steps happened (spec decode off / no rollout).
+        """
+        per_replica = await asyncio.gather(
+            *[replica.pop_policy_verify_timing() for replica in self.rollout_replicas]
+        )
+        fwd_sum = fwd_rej_sum = 0.0
+        n = 0
+        for d in per_replica:
+            if not d:
+                continue
+            fwd_sum += float(d.get("policy_forward_ms_sum", 0.0) or 0.0)
+            fwd_rej_sum += float(d.get("policy_forward_rejection_ms_sum", 0.0) or 0.0)
+            n += int(d.get("n", 0) or 0)
+        if n == 0:
+            return {}
+        return {
+            "rollout/policy_forward_ms_mean": fwd_sum / n,
+            "rollout/policy_forward_ms_total": fwd_sum,
+            "rollout/policy_forward_rejection_ms_mean": fwd_rej_sum / n,
+            "rollout/policy_forward_rejection_ms_total": fwd_rej_sum,
+        }

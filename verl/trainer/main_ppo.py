@@ -139,7 +139,8 @@ class TaskRunnerV1:
 
         from verl.trainer.ppo.v1 import get_trainer_cls
 
-        trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)
+        trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)    # /verl/verl/trainer/config/ppo_trainer.yaml 里trainer_mode默认sync
+                                                                         # get_trainer_cls 返回一个TRAINER_REGISTRY[config.trainer.v1.trainer_mode]
 
         config.transfer_queue.enable = True
         pprint(OmegaConf.to_container(config, resolve=True))
@@ -150,10 +151,10 @@ class TaskRunnerV1:
         tq.init(config.transfer_queue)
         succeeded = False
         try:
-            self.trainer = trainer_cls(config=config)
-            self.trainer.init()
-            self.init_agent_loop_manager()
-            self.trainer.fit(self.agent_loop_manager)
+            self.trainer = trainer_cls(config=config)    # 创建trainer实例
+            self.trainer.init()                          # 初始化trainer(例如初始化分布式环境、创建模型、创建 optimizer、创建 rollout worker)
+            self.init_agent_loop_manager()               # 初始化agent_loop_manager，它负责管理生成轨迹（trajectory）的循环，管理rollout生成，负责怎么生成样本
+            self.trainer.fit(self.agent_loop_manager)    # 开始训练循环，trainer负责怎么用agent_loop_manager生成的这些样本训练 PPO
             succeeded = True
         finally:
             try:

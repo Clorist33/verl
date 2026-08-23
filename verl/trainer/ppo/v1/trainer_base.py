@@ -61,7 +61,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
-from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
+from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_draft_metrics, compute_spec_decode_metrics
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 from verl.trainer.ppo.utils import (
     Role,
@@ -546,6 +546,46 @@ class PPOTrainer(ABC):
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
+        # Check if rollout_only mode is enabled
+        rollout_only = self.config.trainer.get("rollout_only", False)
+
+        if rollout_only:
+            # Rollout-only mode: skip all training updates
+            logger.info(f"[Rollout-Only Mode] Step {self.global_steps}: Skipping training updates, only performing rollout")
+            # Still compute basic metrics for monitoring
+            if self.reward_loop_manager.reward_loop_worker_handles is None:
+                with marked_timer("reward", timing_raw, color="yellow"):
+                    batch = self._compute_reward_colocate(batch, metrics=metrics)
+
+            # Add dummy training fields to TransferQueue to avoid KeyError in metrics computation
+            # These are required by compute_data_metrics() but not computed in rollout_only mode
+            import torch
+            # Read response_mask from TransferQueue to get the shape
+            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["response_mask"])
+            response_mask = data["response_mask"]
+
+            # Create dummy advantages and returns with the same structure as response_mask (nested tensor)
+            dummy_advantages = torch.nested.as_nested_tensor(
+                [torch.zeros(len(response_mask[i]), dtype=torch.float32, device=response_mask.device)
+                 for i in range(len(batch))],
+                layout=torch.jagged,
+            )
+            dummy_returns = torch.nested.as_nested_tensor(
+                [torch.zeros(len(response_mask[i]), dtype=torch.float32, device=response_mask.device)
+                 for i in range(len(batch))],
+                layout=torch.jagged,
+            )
+
+            # Write dummy fields back to TransferQueue
+            tq.kv_batch_put(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                fields=tu.get_tensordict({"advantages": dummy_advantages, "returns": dummy_returns}),
+            )
+
+            return batch
+
+        # Normal training mode: perform full PPO pipeline
         # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
@@ -1293,6 +1333,9 @@ class PPOTrainer(ABC):
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
+            # drive the rollout (vLLM) engine's discrete profiler; NPU/torch rollout trace
+            # is written to VLLM_TORCH_PROFILER_DIR only while start/stop bracket generate()
+            # self.llm_server_manager.start_profile()
 
     def _stop_profiling(self) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
@@ -1315,6 +1358,7 @@ class PPOTrainer(ABC):
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:
                 self.critic_wg.stop_profile()
+            # self.llm_server_manager.stop_profile()
 
     def _fetch_one_gen_batch(self) -> TensorDict:
         """Fetch one ``gen_batch_size`` chunk from the dataloader."""
@@ -1746,10 +1790,17 @@ class PPOTrainer(ABC):
         min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
         max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
 
-        # Only fetch speculative decoding stats when rollout writes them.
+        # Only fetch speculative decoding stats when rollout writes them. Both MTP and
+        # EAGLE3 rollout emit the same per-request spec_* fields (vLLM SpecDecodeStats /
+        # sglang meta_info); either speculative path enables the accept-rate/length metrics.
         spec_drafts = spec_accepts = spec_verifies = None
         mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
-        if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
+        eagle3_config = getattr(self.config.actor_rollout_ref.model, "eagle3", None)
+        spec_rollout_on = (
+            (mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout)
+            or (eagle3_config is not None and getattr(eagle3_config, "enable_rollout", False))
+        )
+        if spec_rollout_on:
             spec_data = tq.kv_batch_get(
                 keys=batch.keys,
                 partition_id=batch.partition_id,
@@ -1764,6 +1815,10 @@ class PPOTrainer(ABC):
                 spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
                 spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields]
                 spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
+                logger.warning("-" * 50)
+                logger.warning("DRAFT-ROLLOUT: spec stats extracted, num_samples=%d, first_draft=%s",
+                               len(spec_drafts), spec_drafts[0] if spec_drafts else None)
+                logger.warning("-" * 50)
 
         data = data.to_padded_tensor()
         data["token_level_scores"] = data["rm_scores"]
@@ -1802,9 +1857,46 @@ class PPOTrainer(ABC):
             }
         )
 
-        # 4. per-request speculative-decoding aggregation (same metrics async PPO logs;
-        # see compute_spec_decode_metrics in verl/trainer/ppo/ray_trainer.py).
+        # 4. EAGLE3/MTP speculative-decoding acceptance from the vLLM global StatLogger.
+        # vLLM V1 exposes spec-decode counts only in the per-step global
+        # scheduler_stats.spec_decoding_stats (never per-request), so we aggregate them
+        # via a custom StatLogger living in each rollout server process and surface
+        # rollout/acceptance_rate, rollout/mean_acceptance_length, rollout/num_draft_tokens,
+        # rollout/num_accepted_tokens. Empty dict when spec decode is off / no drafts.
+        try:
+            spec_metrics = self.llm_server_manager.collect_spec_decode_metrics()
+            if spec_metrics:
+                metrics.update(spec_metrics)
+        except Exception as e:
+            logger.warning(f"[eagle3] Failed to collect spec-decode acceptance metrics: {e}")
+
+        # EAGLE3 policy-verify timing (target forward / forward+rejection ms), accumulated
+        # per verify step in each rollout worker (vllm_ascend model_runner) and pulled via
+        # collective_rpc. Produces rollout/policy_forward_ms_{mean,total} and
+        # rollout/policy_forward_rejection_ms_{mean,total}. Empty when spec decode is off.
+        try:
+            pv_metrics = self.llm_server_manager.collect_policy_verify_timing()
+            if pv_metrics:
+                metrics.update(pv_metrics)
+        except Exception as e:
+            logger.warning(f"[eagle3] Failed to collect policy-verify timing metrics: {e}")
+
+        # 4a. per-request speculative-decoding aggregation (same metrics async PPO logs;
+        # see compute_spec_decode_metrics in verl/trainer/ppo/metric_utils.py).
         metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
+
+        # 4b. EAGLE3 draft-side metrics grouped under one eagle3/ prefix
+        # (eagle3/draft_loss mirrors actor/draft_loss; eagle3/spec_accept_length|rate
+        # mirror rollout/spec_*). No-op for a pure policy run.
+        metrics.update(
+            compute_draft_metrics(
+                metrics=metrics,
+                spec_drafts=spec_drafts,
+                spec_accepts=spec_accepts,
+                spec_verifies=spec_verifies,
+                non_padding_mask=non_padding_mask,
+            )
+        )
 
         # 5. off-policy staleness metrics
         #   global_steps is the model weight version (one update_weights per global_step), and
