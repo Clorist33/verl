@@ -2131,7 +2131,7 @@ class SerialTrainingScheduler:
             - Step 7-11: True
             - Step 12: False
         """
-        return (global_step % self.cycle_length) < self.k
+        return (global_step % self.cycle_length) != 0
 
     def should_train_draft(self, global_step: int) -> bool:
         """判断当前步是否应该训练 draft
@@ -2149,4 +2149,4 @@ class SerialTrainingScheduler:
             - Step 7-11: False
             - Step 12: True
         """
-        return (global_step % self.cycle_length) == self.k
+        return (global_step % self.cycle_length) == 0
