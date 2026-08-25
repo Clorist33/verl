@@ -335,6 +335,32 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     @DistProfiler.annotate(color="red", role="train_batch")
     def train_batch(self, data: TensorDict) -> TensorDict:
+        """训练一个 batch（路由入口）
+
+        【路由方法】根据 train_draft_only 标志决定调用哪个训练逻辑。
+        本方法不包含任何业务逻辑，只做路由判断。
+
+        原有逻辑封装在 _train_batch_original 中（完全不变）。
+        新增逻辑封装在 _train_batch_draft_only 中（独立方法）。
+        """
+        # 提取标志
+        train_draft_only = tu.get_non_tensor_data(data, "train_draft_only", default=False)
+
+        if train_draft_only:
+            # 串行模式：Draft 训练步（新增逻辑）
+            return self._train_batch_draft_only(data)
+        else:
+            # 原有逻辑（并行模式或串行的 actor 步）
+            return self._train_batch_original(data)
+
+    def _train_batch_original(self, data: TensorDict) -> TensorDict:
+        """原有的 train_batch 逻辑（完全不改动，只是重命名）
+
+        【原有逻辑封装】这是原有 train_batch 方法的完整复制。
+        所有逻辑完全不变，只是移动到这个独立方法中。
+
+        关闭串行开关后，执行路径会进入此方法，代码 100% 是原有逻辑。
+        """
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
         # global_token_num should be a list of number of tokens of each seq in this batch
@@ -376,6 +402,65 @@ class TrainingWorker(Worker, DistProfilerExtension):
             output.pop("model_output")
             if lr is not None:
                 output["metrics"]["lr"] = lr
+            final_output = self._postprocess_output(
+                output,
+                global_token_num=global_token_num,
+                delta_time=delta_time,
+                forward_only=False,
+                images_seqlens=images_seqlens,
+            ).cpu()
+        else:
+            final_output = None
+
+        return final_output
+
+    def _train_batch_draft_only(self, data: TensorDict) -> TensorDict:
+        """串行模式的 Draft 训练（新增方法）
+
+        【新增逻辑】专门用于 draft 训练步，与原有逻辑完全独立。
+
+        执行流程：
+        1. Actor forward（冻结参数，生成 teacher）
+        2. Draft forward + loss 计算
+        3. Draft backward + 参数更新
+        """
+        assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
+        assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
+
+        # 获取必要参数
+        global_token_num = tu.get(data, key="global_token_num")
+        disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
+        images_seqlens = tu.get(data, key="images_seqlens", default=None)
+
+        # 注入工程参数
+        default_keys = dict(
+            use_remove_padding=self.model_config.get("use_remove_padding", False),
+            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+            max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
+            micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
+            use_fused_kernels=self.engine_config.use_fused_kernels,
+        )
+
+        for key, val in default_keys.items():
+            if key not in data.extra_info:
+                data.extra_info[key] = val
+
+        # 设置标志（传递给 engine）
+        data.extra_info["train_draft_only"] = True
+        data.extra_info["enable_draft_training"] = True
+
+        # 训练流程
+        with (
+            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+            Timer(name="train_batch_draft", logger=None) as timer,
+        ):
+            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+
+        delta_time = timer.last
+
+        # 处理输出
+        if self.engine.is_mp_src_rank_with_outputs():
+            output.pop("model_output", None)
             final_output = self._postprocess_output(
                 output,
                 global_token_num=global_token_num,
