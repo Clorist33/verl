@@ -287,6 +287,96 @@ def _eagle3_actor_only_step(self, hidden_states, runtime_gather_output):
     return logits
 
 
+def _eagle3_draft_forward_and_stash_loss(
+    self,
+    hidden_states,
+    input_ids,
+    position_ids,
+    loss_mask,
+    output_weight,
+    logits,
+):
+    """Draft 前向 + loss 计算 + 暂存：串行与并行**共用同一份实现**。
+
+    这份实现直接来自并行路径（backup/before-serial-training 分支已验证正确的版本），
+    抽出来成为唯一真源。串行路径过去手抄了一份，抄写中丢了 SP gather、抄错了
+    compute_draft_loss 的参数名和 ttt_length 默认值、抄漏了 loss_mask 的维度判断，
+    连续崩了三次。抽成公共函数后，draft 训练逻辑只有一处定义，不会再出现
+    "改一处漏一处"。
+
+    调用方各自负责异常策略（并行吞掉保 policy 存活；串行抛出，因为串行 Draft 步
+    的唯一目的就是训 draft，吞掉会空转还伪装成成功）和 capture.clear()。
+
+    Returns:
+        compute_draft_loss 的返回 dict（loss 已 append 到 self._eagle3_draft_losses）
+    """
+    # aux hidden captured in-flight during the decoder forward (detached).
+    # Under sequence_parallel (forced on when TP>1), the captured hidden is
+    # SP-sharded on the sequence dim: (S/TP, B, H*num_aux). The draft is a
+    # REPLICATED nn.Module (no TP), and its input_emb = embed_tokens(input_ids)
+    # is FULL sequence, so cat(input_emb, hidden) needs full-seq aux too. Gather
+    # across the SP region here (seqlen-first, gather dim 0), THEN transpose to
+    # (B, S, H*num_aux) as draft.forward expects. aux is detached, so this gather
+    # never feeds gradient back into the policy.
+    capture = getattr(self, "_eagle3_capture", None)
+    draft = self._eagle3_draft[0]
+
+    aux_hidden = capture.get_captured(seqlen_first=True)  # (S/TP, B, H*num_aux)
+    if getattr(self.config, "sequence_parallel", False) and _eagle3_tp_world_size() > 1:
+        from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+
+        aux_hidden = gather_from_sequence_parallel_region(aux_hidden)  # (S, B, H*num_aux)
+    aux_hidden = aux_hidden.transpose(0, 1).contiguous()  # (B, S, H*num_aux)
+
+    ttt_length = getattr(self, "_eagle3_ttt_length", 1)
+    eagle_loss_mask = loss_mask
+    if eagle_loss_mask.dim() == 1:
+        eagle_loss_mask = eagle_loss_mask.unsqueeze(0)
+
+    draft_out = draft(
+        input_ids=input_ids,
+        hidden_states=aux_hidden,
+        loss_mask=eagle_loss_mask,
+        attention_mask=None,
+        position_ids=position_ids,
+        ttt_length=ttt_length,
+    )
+
+    # teacher = FULL-vocab policy logits so t2d (length = full vocab)
+    # indexes correctly. Under TP=1 the policy `logits` above is already
+    # full vocab. Under TP>1 it is only this rank's vocab shard, so
+    # recompute the teacher from the same hidden with a gather. Extra
+    # cost is training-only + draft-only; keeps the policy return path
+    # (its own gather semantics) untouched.
+    if _eagle3_tp_world_size() > 1:
+        teacher_logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=True
+        )
+        teacher_logits = teacher_logits.transpose(0, 1).contiguous()  # [s b v] -> [b s v]
+    else:
+        teacher_logits = logits
+
+    # teacher detach happens inside the loss fn.
+    t2d = draft.t2d
+    logger.warning("-" * 50)
+    logger.warning("DRAFT-TRAIN: hook triggered, captured hidden_states shape=%s, calling compute_draft_loss",
+                   aux_hidden.shape if aux_hidden is not None else None)
+    logger.warning("-" * 50)
+    loss_out = compute_draft_loss(
+        student_logits_per_step=draft_out["logits"],
+        teacher_logits=teacher_logits,
+        t2d=t2d,
+        loss_mask=eagle_loss_mask,
+        position_masks_per_step=draft_out.get("position_masks"),
+        gamma=getattr(self, "_eagle3_gamma", 0.8),
+        temperature=getattr(self, "_eagle3_temperature", 1.0),
+    )
+    if not hasattr(self, "_eagle3_draft_losses"):
+        self._eagle3_draft_losses = []
+    self._eagle3_draft_losses.append(loss_out["loss"])
+    return loss_out
+
+
 def _eagle3_parallel_training(
     self,
     hidden_states,
@@ -351,67 +441,17 @@ def _eagle3_parallel_training(
         )
     if draft is not None and capture is not None and self.training and loss_mask is not None:     #=============================================
         try:
-            # aux hidden captured in-flight during the decoder forward (detached).                         #=============================================取 detached aux hidden + SP gather(:230-243)，若开 SP,抓到的 hidden 是 SP 切片,draft 需要完整序列,先 gather。这是放开 SP 限制的关键修复。
-            # Under sequence_parallel (forced on when TP>1), the captured hidden is
-            # SP-sharded on the sequence dim: (S/TP, B, H*num_aux). The draft is a
-            # REPLICATED nn.Module (no TP), and its input_emb = embed_tokens(input_ids)
-            # is FULL sequence, so cat(input_emb, hidden) needs full-seq aux too. Gather
-            # across the SP region here (seqlen-first, gather dim 0), THEN transpose to
-            # (B, S, H*num_aux) as draft.forward expects. aux is detached, so this gather
-            # never feeds gradient back into the policy.
-            aux_hidden = capture.get_captured(seqlen_first=True)  # (S/TP, B, H*num_aux)
-            if getattr(self.config, "sequence_parallel", False) and _eagle3_tp_world_size() > 1:
-                from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-
-                aux_hidden = gather_from_sequence_parallel_region(aux_hidden)  # (S, B, H*num_aux)
-            aux_hidden = aux_hidden.transpose(0, 1).contiguous()  # (B, S, H*num_aux)                       #=============================================
-
-            ttt_length = getattr(self, "_eagle3_ttt_length", 1)             #============================================= 跑 draft 前向，返回draft_out["logits"]
-            eagle_loss_mask = loss_mask
-            if eagle_loss_mask.dim() == 1:
-                eagle_loss_mask = eagle_loss_mask.unsqueeze(0)
-
-            draft_out = draft(
+            # draft 前向 + loss 计算 + 暂存：与串行路径共用 _eagle3_draft_forward_and_stash_loss，
+            # 唯一真源。本函数只负责"失败了也不能拖死 policy 训练"的异常策略。
+            _eagle3_draft_forward_and_stash_loss(
+                self,
+                hidden_states=hidden_states,
                 input_ids=input_ids,
-                hidden_states=aux_hidden,
-                loss_mask=eagle_loss_mask,
-                attention_mask=None,
                 position_ids=position_ids,
-                ttt_length=ttt_length,
-            )                   #============================================= 
-
-            # teacher = FULL-vocab policy logits so t2d (length = full vocab)               #============================================= 准备 teacher logit
-            # indexes correctly. Under TP=1 the policy `logits` above is already
-            # full vocab. Under TP>1 it is only this rank's vocab shard, so
-            # recompute the teacher from the same hidden with a gather. Extra
-            # cost is training-only + draft-only; keeps the policy return path
-            # (its own gather semantics) untouched.
-            if _eagle3_tp_world_size() > 1:
-                teacher_logits, _ = self.output_layer(
-                    hidden_states, weight=output_weight, runtime_gather_output=True
-                )
-                teacher_logits = teacher_logits.transpose(0, 1).contiguous()  # [s b v] -> [b s v]
-            else:
-                teacher_logits = logits                                                                                         #============================================= 
-
-            # teacher detach happens inside the loss fn.                                                                        #============================================= 算 draft loss 并暂存
-            t2d = draft.t2d                                                                                             
-            logger.warning("-" * 50)
-            logger.warning("DRAFT-TRAIN: hook triggered, captured hidden_states shape=%s, calling compute_draft_loss",
-                           aux_hidden.shape if aux_hidden is not None else None)
-            logger.warning("-" * 50)
-            loss_out = compute_draft_loss(
-                student_logits_per_step=draft_out["logits"],
-                teacher_logits=teacher_logits,
-                t2d=t2d,
-                loss_mask=eagle_loss_mask,
-                position_masks_per_step=draft_out.get("position_masks"),
-                gamma=getattr(self, "_eagle3_gamma", 0.8),
-                temperature=getattr(self, "_eagle3_temperature", 1.0),
+                loss_mask=loss_mask,
+                output_weight=output_weight,
+                logits=logits,
             )
-            if not hasattr(self, "_eagle3_draft_losses"):
-                self._eagle3_draft_losses = []
-            self._eagle3_draft_losses.append(loss_out["loss"])                                                                          #============================================= 
         except _OOM_ERRORS as e:
             # OOM 单独成支：这是最常见的 draft 失败原因，必须计数 + ERROR 级别可见。
             # 仍然吞掉（并行模式的设计意图是 draft 挂了也不能拖死 policy 训练），
@@ -509,63 +549,28 @@ def _eagle3_draft_training_step(
         logger.warning("[DRAFT-TRAIN-SERIAL] Draft or capture not available, skipping draft training")
         return logits
 
-    draft = draft_list[0]  # 从列表中取出实际的 draft module
+    if loss_mask is None:
+        # 串行 Draft 步没有 loss_mask 就无法算 loss，本步注定空转。
+        # 与并行路径的四重门禁保持一致（并行也要求 loss_mask is not None）。
+        logger.warning("[DRAFT-TRAIN-SERIAL] loss_mask is None, skipping draft training")
+        return logits
 
     try:
-        # 3. 获取 captured hidden states
-        # Eagle3HiddenCapture.get_captured(seqlen_first=False) 返回 (B, S, H*num_aux)
-        aux_hidden = capture.get_captured(seqlen_first=False)
-        if aux_hidden is None or aux_hidden.numel() == 0:
-            logger.warning("[DRAFT-TRAIN-SERIAL] No captured hidden states, skipping")
-            return logits
-
-        logger.info(
-            f"[DRAFT-TRAIN-SERIAL] Captured hidden_states shape={aux_hidden.shape}, "
-            f"input_ids shape={input_ids.shape}"
-        )
-
-        # 4. 准备 Draft 输入
-        ttt_length = getattr(self, "_eagle3_ttt_length", None)
-        if loss_mask is not None:
-            eagle_loss_mask = loss_mask.unsqueeze(0)
-        else:
-            eagle_loss_mask = None
-
-        # 5. Draft forward
-        draft_out = draft(
+        # 3-7. draft 前向 + loss 计算 + 暂存
+        # 与并行路径共用 _eagle3_draft_forward_and_stash_loss，唯一真源。
+        # 之前这里是手抄的一份，抄写中丢了 SP gather、抄错了 compute_draft_loss 的
+        # 参数名（draft_logits → student_logits_per_step）和 ttt_length 默认值
+        # （None → 1）、抄漏了 loss_mask 的维度判断，连续崩了三次。
+        # 现在只保留串行特有的异常策略（抛出而非吞掉）。
+        loss_out = _eagle3_draft_forward_and_stash_loss(
+            self,
+            hidden_states=hidden_states,
             input_ids=input_ids,
-            hidden_states=aux_hidden,
-            loss_mask=eagle_loss_mask,
-            attention_mask=None,
             position_ids=position_ids,
-            ttt_length=ttt_length,
+            loss_mask=loss_mask,
+            output_weight=output_weight,
+            logits=logits,
         )
-
-        # 6. 生成 teacher logits（用于 Draft loss 计算）
-        if _eagle3_tp_world_size() > 1:
-            teacher_logits, _ = self.output_layer(
-                hidden_states, weight=output_weight, runtime_gather_output=True
-            )
-            teacher_logits = teacher_logits.transpose(0, 1).contiguous()
-        else:
-            teacher_logits = logits
-
-        # 7. 计算 Draft loss
-        t2d = draft.t2d
-        loss_out = compute_draft_loss(
-            draft_logits=draft_out["logits"],
-            teacher_logits=teacher_logits,
-            t2d=t2d,
-            loss_mask=eagle_loss_mask,
-            position_masks_per_step=draft_out.get("position_masks"),
-            gamma=getattr(self, "_eagle3_gamma", 0.8),
-            temperature=getattr(self, "_eagle3_temperature", 1.0),
-        )
-
-        # 8. 暂存 draft loss（后续 backward 使用）
-        if not hasattr(self, "_eagle3_draft_losses"):
-            self._eagle3_draft_losses = []
-        self._eagle3_draft_losses.append(loss_out["loss"])
 
         logger.info(
             f"[DRAFT-TRAIN-SERIAL] Draft loss={loss_out['loss'].item():.4f}, "
