@@ -16,11 +16,13 @@ import json
 import logging
 import math
 import os
+import sys
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+from io import StringIO
 from pprint import pprint
 from typing import Any, Optional
 
@@ -392,6 +394,10 @@ class PPOTrainer(ABC):
         """
         self.agent_loop_manager = agent_loop_manager
 
+        # === 初始化串行训练配置（如果启用）===
+        if self._is_serial_training_enabled():
+            self._initialize_serial_training_config()
+
         # initialize SkipManager for V1 rollout skip support
         SkipManager.init(self.config)
 
@@ -423,7 +429,38 @@ class PPOTrainer(ABC):
                 return
 
         current_epoch = self.global_steps // self.steps_per_epoch
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # ===创建进度条（只执行1次，每个step只输出一行到日志，会输出初始状态 0/200 [00:00<?, ?it/s] ）==
+        # 创建StringIO buffer来捕获tqdm的输出
+        self.tqdm_buffer = StringIO()
+
+        # 检测是否是终端运行
+        is_terminal = sys.stdout.isatty()
+
+        # 如果是终端，同时输出到stdout（实时显示）和buffer（记录）
+        # 如果不是终端（重定向到文件），只输出到buffer
+        if is_terminal:
+            # 定义一个简单的Tee类，同时写入多个目标
+            class TeeFile:
+                def __init__(self, *files):
+                    self.files = files
+                def write(self, data):
+                    for f in self.files:
+                        f.write(data)
+                def flush(self):
+                    for f in self.files:
+                        f.flush()
+            tqdm_output = TeeFile(sys.stdout, self.tqdm_buffer)
+        else:
+            tqdm_output = self.tqdm_buffer
+
+        progress_bar = tqdm(
+            total=self.total_training_steps,
+            initial=self.global_steps,
+            desc="Training Progress",
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+            file=tqdm_output
+        )
 
         # we start from step 1
         self.global_steps += 1
@@ -492,7 +529,45 @@ class PPOTrainer(ABC):
                 self.dapo_filtered_reward_logger.log(
                     self.config.trainer.logger, dapo_filtered_reward_counts, self.global_steps
                 )
+
+            # === 更新进度条，显示当前步数和训练类型 ===
+            if hasattr(self, '_current_training_type'):
+                # 串行训练模式：显示 global_steps 和 actor_steps/draft_steps
+                if self._current_training_type == "Actor":
+                    progress_desc = (
+                        f"Global {self.global_steps}/{self.total_training_steps} "
+                        f"[Actor {self.actor_steps}/{self.actor_training_steps}]"
+                    )
+                elif self._current_training_type == "Draft":
+                    progress_desc = (
+                        f"Global {self.global_steps}/{self.total_training_steps} "
+                        f"[Draft {self.draft_steps}/{self.draft_training_steps}]"
+                    )
+                else:
+                    progress_desc = f"Step {self.global_steps}"
+            else:
+                # 并行训练模式：只显示步数
+                progress_desc = f"Step {self.global_steps}"
+
+            progress_bar.set_description(progress_desc)
             progress_bar.update(1)
+
+            # === 在非终端模式（日志文件）下，只输出最后一行状态 ===
+            if not is_terminal:
+                # 获取buffer中的所有内容
+                buffer_content = self.tqdm_buffer.getvalue()
+                # tqdm可能使用\r或\n作为分隔符，需要同时处理
+                # 先把\r替换成\n，然后统一按\n分割
+                buffer_content = buffer_content.replace('\r', '\n')
+                # 只取最后一行（最新的进度条状态）
+                lines = buffer_content.strip().split('\n')
+                if lines and lines[-1]:
+                    # 输出到真实stdout（会进入日志文件），保留进度条视觉效果
+                    print(lines[-1], flush=True)
+                # 清空buffer，准备下一个step
+                self.tqdm_buffer.truncate(0)
+                self.tqdm_buffer.seek(0)
+
             self.global_steps += 1
             SkipManager.set_step(self.global_steps)
             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
@@ -533,7 +608,67 @@ class PPOTrainer(ABC):
         return KVBatchMeta(partition_id=combined_partition_id, keys=combined_keys, tags=combined_tags)
 
     def _step_once(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
-        """Run a single local update: sample one mini-batch and perform the full PPO pipeline once."""
+        """Run a single local update: sample one mini-batch and perform the full PPO pipeline once.
+
+        【路由方法】根据配置决定使用串行模式还是并行模式。
+        本方法不包含任何业务逻辑，只做路由判断。
+        """
+        # ========== 路由：串行 or 并行 ==========
+        if self._is_serial_training_enabled():
+            # 串行训练路径（新增）
+            return self._step_once_serial(metrics, timing_raw, sample_batch_size)
+        else:
+            # 并行训练路径（原有逻辑，封装后）
+            return self._step_once_parallel(metrics, timing_raw, sample_batch_size)
+
+    def _is_serial_training_enabled(self) -> bool:
+        """判断是否启用串行训练"""
+        eagle3_config = self.config.algorithm.get('eagle3', {})
+        return bool(eagle3_config.get('enable_serial_training', False))
+
+    def _initialize_serial_training_config(self):
+        """初始化串行训练配置（参数验证已在启动前的 validate_config 完成）
+
+        本方法只负责：
+        1. 读取已验证的配置参数
+        2. 存储到 self
+        3. 初始化步数计数器
+        4. 输出初始化日志
+        """
+        # 1. 获取配置参数（已在 validate_config 验证过，这里直接读取）
+        actor_training_steps = self.config.trainer.get('actor_training_steps')
+        k = self.config.algorithm.eagle3.get('actor_steps_per_draft_step', 5)
+
+        # 2. 计算推导参数
+        draft_training_steps = actor_training_steps // k
+        total_training_steps = actor_training_steps + draft_training_steps
+
+        # 3. 存储参数
+        self.actor_training_steps = actor_training_steps
+        self.draft_training_steps = draft_training_steps
+        self.total_training_steps = total_training_steps
+
+        # 4. 初始化步数计数器
+        self.actor_steps = 0  # Actor 实际完成的训练步数
+        self.draft_steps = 0  # Draft 实际完成的训练步数
+        # self.global_steps 已在父类初始化
+
+        # 5. 日志输出
+        period = k + 1
+        num_cycles = total_training_steps // period
+        logger.info("=" * 60)
+        logger.info("[Serial Training] Initialized scheduler:")
+        logger.info(f"  actor_training_steps:       {self.actor_training_steps}")
+        logger.info(f"  actor_steps_per_draft_step: {k}")
+        logger.info(f"  draft_training_steps:       {self.draft_training_steps}")
+        logger.info(f"  total_training_steps:       {self.total_training_steps}")
+        logger.info(f"  training_ratio:             Actor:{self.actor_training_steps} / Draft:{self.draft_training_steps} = {k}:1")
+        logger.info(f"  period (k+1):               {period} steps/cycle")
+        logger.info(f"  num_cycles:                 {num_cycles} complete cycles")
+        logger.info("=" * 60)
+
+    def _step_once_parallel(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
+        """并行训练流程（原有逻辑）：Actor 和 Draft 同时训练"""
         # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
@@ -621,6 +756,134 @@ class PPOTrainer(ABC):
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
                 batch = self._update_actor(batch, metrics=metrics)
+
+        return batch
+
+    def _step_once_serial(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
+        """串行训练流程：Actor 和 Draft 交替训练（新增方法）
+
+        【新增逻辑】与原有逻辑完全独立，不影响并行模式。
+        """
+        # 1. 初始化调度器（首次调用）
+        if not hasattr(self, '_serial_scheduler'):
+            eagle3_config = self.config.algorithm.get('eagle3', {})
+            k = eagle3_config.get('actor_steps_per_draft_step', 5)
+            self._serial_scheduler = SerialTrainingScheduler(k)
+            logger.info(f"[Serial Training] Initialized scheduler with k={k}")
+
+        # 2. 判断当前步骤类型
+        train_actor = self._serial_scheduler.should_train_actor(self.global_steps)
+        train_draft = self._serial_scheduler.should_train_draft(self.global_steps)
+
+        # === 记录当前步骤类型（用于进度条显示）===
+        if train_actor:
+            self._current_training_type = "Actor"
+        elif train_draft:
+            self._current_training_type = "Draft"
+        else:
+            self._current_training_type = "Unknown"
+
+        logger.debug(
+            f"[Serial Training] Step {self.global_steps}: train_actor={train_actor}, train_draft={train_draft}"
+        )
+
+        # 3. sample batch from replay buffer
+        with marked_timer("gen", timing_raw, color="red"):
+            self.on_sample_begin()
+            batch, off_policy_metrics = self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="train",
+                batch_size=sample_batch_size,
+            )
+            metrics.update(off_policy_metrics)
+            batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            self.on_sample_end()
+
+        # 4. [OPTIONAL] compute reward score with colocated reward model
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            with marked_timer("reward", timing_raw, color="yellow"):
+                batch = self._compute_reward_colocate(batch, metrics=metrics)
+
+        # 5. balance batch across data parallel groups
+        batch = self._balance_batch(batch, metrics=metrics)
+
+        # ========== 分支：Actor 训练步 vs Draft 训练步 ==========
+        if train_actor:
+            # === Actor 训练步：禁用 draft ===
+            # 注意：extra_info 会被 _compute_old_log_prob 内的 tq.kv_batch_put 整体重建
+            # （返回全新 KVBatchMeta，extra_info 为空），所以这里设的标志活不到
+            # _update_actor。必须同时存到 self 上，由 _update_actor 重新注入。
+            self._eagle3_serial_flags = {'enable_draft_training': False, 'train_draft_only': False}
+            batch.extra_info.update(self._eagle3_serial_flags)
+
+            logger.debug(f"[Serial Training] Step {self.global_steps}: Actor training step")
+
+            # 6. compute old_log_prob
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                batch = self._compute_old_log_prob(batch, metrics=metrics)
+
+            # 7. [OPTIONAL] compute ref_log_prob
+            if self.use_reference_policy:
+                with marked_timer("ref", timing_raw, color="olive"):
+                    batch = self._compute_ref_log_prob(batch, metrics=metrics)
+
+            # 8. [OPTIONAL] compute critic values
+            if self.use_critic:
+                with marked_timer("values", timing_raw, color="cyan"):
+                    batch = self._compute_values(batch, metrics=metrics)
+
+            # 9. compute advantage and return
+            with marked_timer("adv", timing_raw, color="brown"):
+                batch = self._compute_advantage(batch, metrics=metrics)
+
+            # 10. [OPTIONAL] update critic
+            if self.use_critic:
+                with marked_timer("update_critic", timing_raw, color="pink"):
+                    batch = self._update_critic(batch, metrics=metrics)
+
+            # 11. update actor
+            if self.config.trainer.critic_warmup <= self.global_steps:
+                with marked_timer("update_actor", timing_raw, color="red"):
+                    batch = self._update_actor(batch, metrics=metrics)
+
+            # === 增加 Actor 步数 ===
+            self.actor_steps += 1
+            logger.debug(f"[Serial Training] Global Step {self.global_steps}: "
+                        f"Actor step {self.actor_steps}/{self.actor_training_steps}")
+
+        elif train_draft:
+            # === Draft 训练步：Actor forward（冻结）+ Draft 训练 ===
+            # 同上：标志同时存到 self，防止中途 extra_info 被重建后丢失。
+            self._eagle3_serial_flags = {'enable_draft_training': True, 'train_draft_only': True}
+            batch.extra_info.update(self._eagle3_serial_flags)
+
+            logger.info(f"[Serial Training] Step {self.global_steps}: Draft training step")
+
+            # 调用 Draft 专属训练流程
+            with marked_timer("update_draft", timing_raw, color="purple"):
+                batch = self._update_draft(batch, metrics=metrics)
+
+            # === 增加 Draft 步数 ===
+            self.draft_steps += 1
+            logger.debug(f"[Serial Training] Global Step {self.global_steps}: "
+                        f"Draft step {self.draft_steps}/{self.draft_training_steps}")
+
+        return batch
+
+    def _update_draft(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Draft 训练步骤（新增方法）：
+        1. Actor forward（冻结）生成 teacher logits + hidden states
+        2. Draft forward + loss 计算
+        3. Draft backward + 参数更新
+        """
+        output: TensorDict = self.actor_rollout_wg.update_draft(batch)
+
+        # 提取 draft metrics
+        if output is not None:
+            from verl.utils.py_functional import rename_dict
+
+            draft_metrics = rename_dict(output["metrics"], "draft/")
+            metrics.update(draft_metrics)
 
         return batch
 
@@ -1750,6 +2013,13 @@ class PPOTrainer(ABC):
         }
         batch.extra_info.update(extra_info)
 
+        # === EAGLE3 串行训练：重新注入标志 ===
+        # extra_info 在 _compute_old_log_prob → tq.kv_batch_put 处被整体重建，
+        # 串行标志已丢失。必须在调用 worker 前补回，否则 forward_step 读到默认值
+        # enable_draft_training=True，Actor 步仍会跑 draft 前向导致 OOM。
+        if hasattr(self, '_eagle3_serial_flags'):
+            batch.extra_info.update(self._eagle3_serial_flags)
+
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
         output = rename_dict(output["metrics"], "actor/")
         output["perf/mfu/actor"] = output.pop("actor/mfu")
@@ -1857,6 +2127,16 @@ class PPOTrainer(ABC):
             }
         )
 
+        # === 串行训练专用 metrics ===
+        if self._is_serial_training_enabled():
+            metrics.update({
+                "training/global_steps": self.global_steps,
+                "training/actor_steps": self.actor_steps,
+                "training/draft_steps": self.draft_steps,
+                "training/actor_progress": self.actor_steps / self.actor_training_steps if self.actor_training_steps > 0 else 0,
+                "training/draft_progress": self.draft_steps / self.draft_training_steps if self.draft_training_steps > 0 else 0,
+            })
+
         # 4. EAGLE3/MTP speculative-decoding acceptance from the vLLM global StatLogger.
         # vLLM V1 exposes spec-decode counts only in the per-step global
         # scheduler_stats.spec_decoding_stats (never per-request), so we aggregate them
@@ -1929,6 +2209,38 @@ class PPOTrainer(ABC):
 
 
 TRAINER_REGISTRY: dict[str, type[PPOTrainer]] = {}
+
+
+class SerialTrainingScheduler:
+    """串行训练调度器：决定每个 step 训练 Actor 还是 Draft
+
+    【调度策略】每 k 个 Actor step 后，训练 1 个 Draft step
+    - step 1, 2, ..., k: Actor
+    - step k+1: Draft
+    - step k+2, k+3, ..., 2k+1: Actor
+    - step 2k+2: Draft
+    - ...
+
+    示例（k=5）：
+    - step 1,2,3,4,5 → Actor
+    - step 6 → Draft
+    - step 7,8,9,10,11 → Actor
+    - step 12 → Draft
+    """
+    def __init__(self, k: int = 5):
+        """
+        Args:
+            k: Actor 训练步数与 Draft 训练步数的比例（k:1）
+        """
+        self.k = k
+
+    def should_train_actor(self, global_steps: int) -> bool:
+        """判断当前步是否训练 Actor"""
+        return (global_steps % (self.k + 1)) != 0
+
+    def should_train_draft(self, global_steps: int) -> bool:
+        """判断当前步是否训练 Draft"""
+        return (global_steps % (self.k + 1)) == 0
 
 
 def register_trainer(name: str):

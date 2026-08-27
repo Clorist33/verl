@@ -87,10 +87,20 @@ def resolve_capture_layer_ids(
     chosen = None
     if ckpt_ids:
         chosen = list(ckpt_ids)
+        print("="*100)
+        print("use ckpt_ids")
+        print("="*100)
     elif config_ids:
         chosen = list(config_ids)
+        print("="*100)
+        print("use config_ids")
+        print("="*100)
     else:
         chosen = get_eagle3_aux_hidden_state_layers(num_layers)
+        print("="*100)
+        print("use formula_ids")
+        print("="*100)
+        
     for i in chosen:
         if i < 0 or i >= num_layers:
             raise ValueError(

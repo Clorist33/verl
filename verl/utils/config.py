@@ -14,10 +14,99 @@
 
 from dataclasses import is_dataclass
 from typing import Any, Optional
+import logging
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-__all__ = ["omega_conf_to_dataclass", "validate_config"]
+logger = logging.getLogger(__name__)
+
+__all__ = ["omega_conf_to_dataclass", "validate_config", "_validate_eagle3_serial_training_config"]
+
+
+def _validate_eagle3_serial_training_config(config: DictConfig) -> None:
+    """在训练启动前（worker初始化之前）验证 EAGLE3 串行训练配置
+
+    串行模式要求：
+    1. 必须设置 actor_training_steps
+    2. total_training_steps 必须是 (k+1) 的整数倍（周期对齐）
+
+    推导关系：
+    - draft_training_steps = actor_training_steps // k
+    - total_training_steps = actor_training_steps + draft_training_steps
+    - 周期 = k+1（k 个 Actor 步 + 1 个 Draft 步）
+
+    Args:
+        config: Hydra 配置对象
+
+    Raises:
+        ValueError: 配置不合法时抛出，包含详细的错误说明和修复建议
+    """
+    # 检查是否启用串行训练
+    eagle3_config = config.algorithm.get('eagle3', {})
+    if not eagle3_config.get('enable_serial_training', False):
+        return  # 未启用串行训练，跳过验证
+
+    # 1. 获取配置参数
+    actor_training_steps = config.trainer.get('actor_training_steps', None)
+    k = eagle3_config.get('actor_steps_per_draft_step', 5)
+
+    # 2. 验证：必须设置 actor_training_steps
+    if actor_training_steps is None:
+        raise ValueError(
+            "[Serial Training] 串行训练模式必须设置 'actor_training_steps' 参数。\n"
+            "示例配置：\n"
+            "trainer:\n"
+            "  actor_training_steps: 100  # Actor 训练步数（建议设为 k 的倍数）\n"
+            "algorithm:\n"
+            "  eagle3:\n"
+            "    enable_serial_training: true\n"
+            "    actor_steps_per_draft_step: 5  # k=5，周期为 k+1=6"
+        )
+
+    # 3. 计算推导参数
+    draft_training_steps = actor_training_steps // k
+    total_training_steps = actor_training_steps + draft_training_steps
+
+    # 4. 验证：total_training_steps 必须是 (k+1) 的整数倍（周期对齐）
+    period = k + 1
+    if total_training_steps % period != 0:
+        # 计算最接近的合法值
+        cycles_down = total_training_steps // period
+        cycles_up = cycles_down + 1
+        actor_down = cycles_down * k
+        actor_up = cycles_up * k
+        total_down = cycles_down * period
+        total_up = cycles_up * period
+
+        raise ValueError(
+            f"[Serial Training] 配置不合法：\n"
+            f"  actor_training_steps = {actor_training_steps}\n"
+            f"  draft_training_steps = {draft_training_steps} (计算值: actor_training_steps // k)\n"
+            f"  total_training_steps = {total_training_steps} (计算值: actor + draft)\n"
+            f"  周期 (k+1) = {period}\n"
+            f"\n"
+            f"❌ 问题：total_training_steps ({total_training_steps}) 不是周期 ({period}) 的整数倍。\n"
+            f"   这会导致最后几步的训练类型不符合预期（Actor/Draft 混乱）。\n"
+            f"\n"
+            f"✅ 建议修改 actor_training_steps 为以下值之一：\n"
+            f"   - {actor_down}  → total={total_down} ({cycles_down} 个完整周期, {cycles_down} 个 Draft 步)\n"
+            f"   - {actor_up}  → total={total_up} ({cycles_up} 个完整周期, {cycles_up} 个 Draft 步)\n"
+            f"\n"
+            f"💡 通用规则：actor_training_steps 设为 k 的倍数，即可保证周期对齐。"
+        )
+
+    # 5. 验证通过，输出日志
+    num_cycles = total_training_steps // period
+    logger.info("=" * 60)
+    logger.info("[Serial Training] Configuration validated (before training):")
+    logger.info(f"  actor_training_steps:       {actor_training_steps}")
+    logger.info(f"  actor_steps_per_draft_step: {k}")
+    logger.info(f"  draft_training_steps:       {draft_training_steps} (calculated)")
+    logger.info(f"  total_training_steps:       {total_training_steps} (calculated)")
+    logger.info(f"  training_ratio:             Actor:{actor_training_steps} / Draft:{draft_training_steps} = {k}:1")
+    logger.info(f"  period (k+1):               {period} steps/cycle")
+    logger.info(f"  num_cycles:                 {num_cycles} complete cycles")
+    logger.info("=" * 60)
 
 
 def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[type[Any]] = None) -> Any:
@@ -83,6 +172,9 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    # === EAGLE3 串行训练参数验证（在任何worker初始化前进行）===
+    _validate_eagle3_serial_training_config(config)
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 

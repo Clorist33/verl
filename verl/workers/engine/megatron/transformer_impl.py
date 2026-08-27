@@ -1152,6 +1152,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
         loss_mask = model_inputs["loss_mask"]
 
         unwrapped_model = unwrap_model(model)
+
+        # === EAGLE3 串行训练：把标志挂到模型实例上 ===
+        # eagle3_patch 的 _postprocess 路由需要这两个标志，但 Megatron 的
+        # forward 签名不会把它们透传下去（extra_block_kwargs 是 decoder 层的
+        # kwargs，不含这些自定义标志）。这里直接挂到 unwrapped model 上，
+        # 由 _megatron_gptmodel_postprocess_eagle3 从 self 读取。
+        unwrapped_model._eagle3_train_draft_only = tu.get_non_tensor_data(
+            batch, key="train_draft_only", default=False
+        )
+        unwrapped_model._eagle3_enable_draft_training = tu.get_non_tensor_data(
+            batch, key="enable_draft_training", default=True
+        )
+
         if hasattr(unwrapped_model, "vp_stage"):
             vp_rank = unwrapped_model.vp_stage
         else:
@@ -1284,10 +1297,42 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if loss_function is not None:
             # TODO(baiyan): How to support hybrid context parallel with dp_group,
             # now the dp_group is not used, so just leave it as is, but what if we need to use it?
-            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
-            # scale loss by num_micro_batch because megatron will scale loss
-            # by n_micro_batch inside pp schedule
-            scaled_loss = loss * data["num_micro_batch"]
+
+            # === 检查是否是 draft 训练步（串行模式）===
+            # 注意：V1 架构中 micro-batch 是 TensorDict，没有 extra_info 属性，
+            # 非张量元数据必须通过 tu.get_non_tensor_data 读取（与 engine_workers.py 一致）
+            train_draft_only = tu.get_non_tensor_data(data, "train_draft_only", default=False)
+
+            if train_draft_only:
+                # === 串行模式：Draft 训练步 ===
+                # Draft loss 已经在 eagle3_patch.py 中计算并暂存
+                # 这里从 model 中聚合所有 microbatch 的 draft losses
+                draft_losses = []
+                for module in self.model:
+                    if hasattr(module, "_eagle3_draft_losses"):
+                        draft_losses.extend(module._eagle3_draft_losses)
+                        # 清空暂存，准备下一个 step
+                        module._eagle3_draft_losses.clear()
+
+                if draft_losses:
+                    # 聚合所有 microbatch 的 draft loss
+                    loss = torch.stack(draft_losses).mean()
+                    metrics = {
+                        "draft/loss": loss.item(),
+                        "draft/num_microbatches": len(draft_losses),
+                    }
+                else:
+                    # 没有 draft loss（异常情况）
+                    loss = torch.tensor(0.0, device=device)
+                    metrics = {"draft/loss": 0.0, "draft/num_microbatches": 0}
+
+                scaled_loss = loss * data["num_micro_batch"]
+            else:
+                # === 并行模式 or 串行 Actor 步：使用正常的 loss function ===
+                loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+                # scale loss by num_micro_batch because megatron will scale loss
+                # by n_micro_batch inside pp schedule
+                scaled_loss = loss * data["num_micro_batch"]
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=device)

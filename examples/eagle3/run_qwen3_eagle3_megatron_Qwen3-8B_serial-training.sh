@@ -127,6 +127,14 @@ TTT_LENGTH=${TTT_LENGTH:-1}                              # 1 = single-step (P2a)
 #   True  = 启用串行模式 (Actor 和 Draft 交替训练，降低显存)
 #   False = 使用并行模式 (默认，Actor 和 Draft 同时训练)
 #
+# actor_training_steps:
+#   Actor 训练的总步数（串行模式专用参数，新增）
+#   - 串行模式下，此参数优先于 total_training_steps
+#   - 必须是 actor_steps_per_draft_step 的整数倍
+#   - Draft 步数自动计算：actor_training_steps / actor_steps_per_draft_step
+#   - 总步数自动计算：actor_training_steps + draft_training_steps
+#   示例：actor_training_steps=1000, k=5 → draft=200, total=1200
+#
 # actor_steps_per_draft_step (k 值):
 #   控制 Actor 训练步数与 Draft 训练步数的比例
 #   - k=5 (推荐默认): 每训练 5 步 actor，训练 1 步 draft
@@ -136,18 +144,20 @@ TTT_LENGTH=${TTT_LENGTH:-1}                              # 1 = single-step (P2a)
 #   - k=1: 完全交替训练，最大显存优化但速度较慢
 #
 # 使用方法:
-#   # 启用串行训练 (k=5)
-#   ENABLE_SERIAL_TRAINING=True bash run_qwen3_eagle3_megatron_Qwen3-8B.sh
+#   # 启用串行训练 (k=5, Actor 训练 1000 步)
+#   ENABLE_SERIAL_TRAINING=True ACTOR_TRAINING_STEPS=1000 bash run_qwen3_eagle3_megatron_Qwen3-8B.sh
 #
 #   # 自定义 k 值
-#   ENABLE_SERIAL_TRAINING=True ACTOR_STEPS_PER_DRAFT_STEP=7 \
+#   ENABLE_SERIAL_TRAINING=True ACTOR_TRAINING_STEPS=1000 ACTOR_STEPS_PER_DRAFT_STEP=7 \
 #     bash run_qwen3_eagle3_megatron_Qwen3-8B.sh
 #
 # 预期效果 (Qwen3-8B, k=5):
 #   - 显存峰值: ~45GB -> ~30GB (降低 33%)
 #   - 训练速度: 约为并行模式的 70-80%
+#   - Actor 训练曲线与并行模式可直接对比（横轴相同）
 #
-ENABLE_SERIAL_TRAINING=${ENABLE_SERIAL_TRAINING:-False}
+ENABLE_SERIAL_TRAINING=${ENABLE_SERIAL_TRAINING:-True}
+ACTOR_TRAINING_STEPS=${ACTOR_TRAINING_STEPS:-100}
 ACTOR_STEPS_PER_DRAFT_STEP=${ACTOR_STEPS_PER_DRAFT_STEP:-5}
 
 # Draft implementation backend:
@@ -188,14 +198,35 @@ max_response_length=${MAX_RESPONSE_LENGTH:-8192}  # OOM: 长序列 → gather �
 
 # ====batch-size====
 train_prompt_bsz=${TRAIN_BATCH_SIZE:-32}            #这里主要是控制推理的时候用多少条数据
-train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-4}     # 这里主要是控制actor 一次updtate的条数，实际上一次update的条数是这里的PPO_MINI_BATCH_SIZE*ROLLOUT_N=8PPO_MINI_BATCH_SIZE 
+train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-4}     # 这里主要是控制actor 一次updtate的条数，实际上一次update的条数是这里的PPO_MINI_BATCH_SIZE*ROLLOUT_N=8PPO_MINI_BATCH_SIZE
 ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+
+# ===== Draft Batch Size 配置（串行训练可选）=====
+# 如果不设置，Draft 将使用 Actor 的 batch size 参数（fallback 机制）
+# 设置后，Draft 可以使用独立的 batch size，优化显存使用
+#
+# draft_ppo_mini_batch_size:
+#   Draft 的 mini batch size
+#   - 不设置：使用 Actor 的 ppo_mini_batch_size
+#   - 设置：Draft 使用独立的 mini batch size
+#
+# draft_ppo_micro_batch_size_per_gpu:
+#   Draft 的 micro batch size per GPU
+#   - 不设置：使用 Actor 的 ppo_micro_batch_size_per_gpu
+#   - 设置：Draft 使用独立的 micro batch size
+#
+# 使用场景：
+#   - Draft 模型较小：可以使用更大的 batch size
+#   - Draft 模型较大：可以使用更小的 batch size 避免 OOM
+#   - 优化显存使用：根据实际情况调整
+DRAFT_PPO_MINI_BATCH_SIZE=${DRAFT_PPO_MINI_BATCH_SIZE:- 16}  # 默认为空，使用 Actor 的值
+DRAFT_PPO_MICRO_BATCH_SIZE_PER_GPU=${DRAFT_PPO_MICRO_BATCH_SIZE_PER_GPU:- 8}  # 默认为空，使用 Actor 的值
 
 
 n_resp_per_prompt=${ROLLOUT_N:-8}
 actor_lr=${ACTOR_LR:-1e-6}
 total_epochs=${TOTAL_EPOCHS:-1}
-total_training_steps=${TOTAL_TRAINING_STEPS:-100}
+total_training_steps=${TOTAL_TRAINING_STEPS:-120}
 save_freq=${SAVE_FREQ:-10}
 test_freq=${TEST_FREQ:--1}
 ppo_max_token_len=$((max_prompt_length + max_response_length))
@@ -285,6 +316,10 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz}
 
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}
+
+    # ===== Draft Batch Size 配置（串行训练可选）=====
+    +actor_rollout_ref.actor.draft_ppo_mini_batch_size=${DRAFT_PPO_MINI_BATCH_SIZE}
+    +actor_rollout_ref.actor.draft_ppo_micro_batch_size_per_gpu=${DRAFT_PPO_MICRO_BATCH_SIZE_PER_GPU}
 
     actor_rollout_ref.actor.optim.lr=${actor_lr}
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp}
@@ -383,6 +418,7 @@ TRAINER=(
     trainer.val_before_train=False
     trainer.total_epochs=${total_epochs}
     trainer.total_training_steps=${total_training_steps}
+    +trainer.actor_training_steps=${ACTOR_TRAINING_STEPS}
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
     trainer.default_local_dir="${CKPTS_DIR}"

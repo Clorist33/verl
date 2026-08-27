@@ -554,10 +554,11 @@ def setup_eagle3_training(engine, policy_module_list) -> Optional[Eagle3Training
 
     # =================================================
     # 确定抽取policy模型的哪几层hiddenstate
-    # capture layer ids: config > ckpt-embedded (draft config) > formula
-    ckpt_ids = _draft_ckpt_layer_ids(engine.model_config.eagle3)
-    config_ids = list(eagle3_cfg.capture_layer_ids) if eagle3_cfg.capture_layer_ids else None
-    layer_ids = resolve_capture_layer_ids(num_layers, config_ids=config_ids, ckpt_ids=ckpt_ids)
+    # capture layer ids: ckpt 内嵌 > 配置文件 > 默认公式
+    ckpt_ids = _draft_ckpt_layer_ids(engine.model_config.eagle3)                                          # 从 draft ckpt 读
+    config_ids = list(eagle3_cfg.capture_layer_ids) if eagle3_cfg.capture_layer_ids else None             # 从配置读：eagle3_cfg = engine.model_config.eagle3
+    layer_ids = resolve_capture_layer_ids(num_layers, config_ids=config_ids, ckpt_ids=ckpt_ids)           # 实际上，config_ids=None，ckpt_ids=None，走的resolve_capture_layer_ids里面的默认公式计算
+    # breakpoint()
 
     # =================================================
     # 建 draft 模块，重点看这里！！！！！！！！！！！！！！！！
@@ -580,7 +581,7 @@ def setup_eagle3_training(engine, policy_module_list) -> Optional[Eagle3Training
     # Optional: activation-checkpoint the draft backbone to cut the draft-path
     # activation peak (P5-09). Default off (unchanged behavior); flag lives on the
     # raw module and is honored inside draft_mcore.forward (ttt==1 + training only).
-    if getattr(eagle3_cfg, "draft_forward_checkpoint", False):
+    if getattr(eagle3_cfg, "draft_forward_checkpoint", False):    # draft_forward_checkpoint=True的时候会开启draft的重计算，默认false，不开启draft的重计算
         draft_raw._use_forward_checkpoint = True
         logger.info("eagle3: draft backbone activation-checkpointing ENABLED")
 
@@ -597,7 +598,7 @@ def setup_eagle3_training(engine, policy_module_list) -> Optional[Eagle3Training
     draft_optimizer = _build_draft_optimizer(draft_module, eagle3_cfg)
 
     # =================================================
-    # 挂 hidden capture + patch 前向，重点看这里！！！！！！！！！！！！！！！！
+    # 挂 hidden capture + patch 前向，loss的计算逻辑也在这里，重点看这里！！！！！！！！！！！！！！！！
     # hidden capture on the policy decoder layers + patch _postprocess
     capture = Eagle3HiddenCapture(gpt, capture_layer_ids=layer_ids).register()
     ## 
@@ -860,24 +861,36 @@ def eagle3_backward_step(engine) -> Optional[float]:
 
     draft_loss = torch.stack([l for l in losses]).mean()
     state.draft_optimizer.zero_grad(set_to_none=True)
+
+    # ========== 🔬 EXPERIMENT: Draft training disabled ==========
+    # Testing whether sync path corrupts weights (e.g., missing lm_head).
+    # If acceptance rate still drops at step 2 with frozen weights → sync bug.
+    # If it stays stable → training updates too large.
+    # TODO: Remove the next 2 lines and uncomment the block below to restore.
+    # print("🔬 EXPERIMENT: Draft training DISABLED (weights frozen at init)")
+    # return float(draft_loss.detach().item())
+    # ========== END EXPERIMENT ==========
+
+    # ========== ORIGINAL CODE (commented out for experiment) ==========
     draft_loss.backward()
     logger.warning("-" * 50)
     logger.warning("DRAFT-TRAIN: draft backward done, draft_loss=%f", draft_loss.item())
     logger.warning("-" * 50)
-
+    
     clip = engine.model_config.eagle3.draft_optim_clip_grad
     if clip and clip > 0:
         torch.nn.utils.clip_grad_norm_(state.draft_module.parameters(), max_norm=clip)
-
+    
     # optim state must be on-device for step(); park it back on CPU afterwards.
     if getattr(state, "optim_offload", False):
         _load_draft_optimizer(state.draft_optimizer)
     state.draft_optimizer.step()
     if getattr(state, "optim_offload", False):
         _offload_draft_optimizer(state.draft_optimizer)
-
+    
     logger.warning("-" * 50)
     logger.warning("DRAFT-METRIC: draft_loss calculated = %f", draft_loss.item())
     logger.warning("-" * 50)
     return float(draft_loss.detach().item())
+    # ========== END ORIGINAL CODE ==========
 

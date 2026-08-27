@@ -90,8 +90,8 @@ def run_ppo(config, task_runner_class) -> None:
         )
         runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = task_runner_class.remote()
-    ray.get(runner.run.remote(config))
+        runner = task_runner_class.remote()    # 创建远程 TaskRunner（Ray remote actor），因为传入的task_runner_class=TaskRunnerV1，所以runner =TaskRunnerV1.remote()。整个训练循环运行在 Ray remote actor (TaskRunnerV1) 中，这是一个单独的进程
+    ray.get(runner.run.remote(config))         # 远程执行 run() 方法（阻塞等待完成），这里下一步会跳到TaskRunnerV1.run()
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
@@ -100,7 +100,7 @@ def run_ppo(config, task_runner_class) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
-@ray.remote
+@ray.remote    # Ray 会把下面的Class包装成一个 Actor Class。这个 Actor 类：可以运行在 Ray 集群的某个 worker 上 有自己的进程、有自己的状态
 class TaskRunnerV1:
     """V1 TaskRunner for PPO training."""
 

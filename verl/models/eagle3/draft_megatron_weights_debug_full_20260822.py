@@ -448,8 +448,8 @@ def _load_hf_draft_state(draft_path: str) -> dict:
 
 def _target_state(draft) -> dict:
     """Build {name: tensor} from params + buffers (avoids Megatron _get_extra_state)."""
-    st = {name: p for name, p in draft.named_parameters()}  # draft.named_parameters()采集所有可训练参数 例如: {"eagle_module.fc.weight": Tensor([8000,4096]), ...}
-    for name, buf in draft.named_buffers():   #draft.named_buffers():采集不可训练参数。# 例如: {"t2d": Tensor([32000]), "d2t": Tensor([151936])}
+    st = {name: p for name, p in draft.named_parameters()}
+    for name, buf in draft.named_buffers():
         if buf is not None:
             st[name] = buf
     return st
@@ -465,244 +465,378 @@ def load_megatron_draft_weights(draft, draft_path: str, tp_group=None) -> None:
     frozen by engine_support._inject_and_freeze_draft_embed AFTER this call, so it is
     expected in `missing`. The draft's own trained lm_head (eagle_output_layer) IS loaded
     (EAGLE3 drafts ship a real head over the draft vocab; do not overwrite from policy).
+
+    draft:实例化 MegatronEagle3DraftModel
+    draft_path:磁盘保存的draft权重路径
+    tp_group:draft的tp（在训练脚本里由“DRAFT_TP”传递）
     """
+
+    #=================从 draft 模型的 config 读取注意力头配置,用于后续 qkv 融合=================
     global _ACTIVE_TP_GROUP
     cfg = draft.config
-    num_heads = cfg.num_attention_heads
-    num_groups = getattr(cfg, "num_query_groups", num_heads)
-    head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // num_heads)
+    num_heads = cfg.num_attention_heads   # 32
+    num_groups = getattr(cfg, "num_query_groups", num_heads)   # 8
+    head_dim = getattr(cfg, "kv_channels", cfg.hidden_size // num_heads)  #128
 
-    hf_state = _load_hf_draft_state(draft_path)
-    model_state = _target_state(draft)
+    #=================加载 HF checkpoint=================
+    hf_state = _load_hf_draft_state(draft_path) 
 
+    # DRAFT-WEIGHT-DEBUG: Print loading parameters and HF weight statistics
+    print("=" * 80)
+    print(f"DRAFT-WEIGHT-DEBUG: Starting HF→Megatron draft weight loading")
+    print(f"  draft_path: {draft_path}")
+    print(f"  num_heads: {num_heads}")
+    print(f"  num_groups: {num_groups}")
+    print(f"  head_dim: {head_dim}")
+    print(f"  TP group: {tp_group} (size={tp_group.size() if tp_group else 1})")
+    print("-" * 80)
+    print(f"HF state keys loaded: {len(hf_state)}")
+    for key in sorted(hf_state.keys()):
+        tensor = hf_state[key]
+        print(f"  [HF] {key}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+              f"mean={tensor.float().mean().item():.6f} std={tensor.float().std().item():.6f}")
+    print("=" * 80)
+
+    #=================准备目标状态=================
+    # 调用 _target_state (行 449-455):
+    #   -从 draft.named_parameters() 和 draft.named_buffers() 合并成字典
+    #   -用于提供目标形状和 dtype,不包含实际权重值(随机初始化)
+    model_state = _target_state(draft)  # 拿目标格式
+    # breakpoint()
+
+
+    #================= HF → Megatron 格式转换 + TP 切分=================
     _ACTIVE_TP_GROUP = tp_group
     try:
-        mapped = map_hf_to_megatron_draft(hf_state, model_state, num_heads, num_groups, head_dim)
+        mapped = map_hf_to_megatron_draft(hf_state, model_state, num_heads, num_groups, head_dim)    # 把 HF→Megatron(融合 QKV/gate-up + TP 切分),得到 mapped
     finally:
         _ACTIVE_TP_GROUP = None
 
-    missing, unexpected = draft.load_state_dict(mapped, strict=False)
+    # ===== 权重对比检查_REVERT_20260821 (调试用,回退时删除本块) =====
+    # 逐层打印 HF 原始权重与 mapped 切分后权重的实际数值,并排对比。
+    # 期望值全部直接从 hf_state 手工切片,不复用本文件的融合/切分函数。
+    tp_rank, tp_world = _tp_rank_world()
+    N = 8  # 每行打印前 N 个数
+
+    def head(t):
+        """取张量第 0 行前 N 个数,格式化成一行。"""
+        if t is None:
+            return "无"
+        f = t.reshape(-1)[:N] if t.dim() == 1 else t[0, :N]
+        return " ".join(f"{v:+.6f}" for v in f.float().tolist())
+
+    def row(t, i):
+        """取张量第 i 行前 N 个数。"""
+        if t is None or i >= t.shape[0]:
+            return "无"
+        return " ".join(f"{v:+.6f}" for v in t[i, :N].float().tolist())
+
+    def check(name, mg_key, expect, src):
+        """打印 mapped[mg_key] 与手工重建期望值的首行数值及是否相等。"""
+        got = mapped.get(mg_key)
+        print(f"  [{name}]")
+        print(f"    HF  来源 {src}")
+        print(f"    HF  首行 {head(expect)}")
+        print(f"    切分首行 {head(got)}")
+        if got is None or expect is None:
+            print("    结论 缺失,无法对比")
+            return
+        if got.shape != expect.shape:
+            print(f"    结论 形状不符 切分={tuple(got.shape)} 期望={tuple(expect.shape)}")
+            return
+        g, e = got.cpu().float(), expect.cpu().float()
+        bad = int((g != e).sum())
+        if bad == 0:
+            print(f"    结论 完全一致 形状={tuple(got.shape)}")
+        else:
+            idx = (g != e).nonzero()[0].tolist()
+            print(f"    结论 不一致 形状={tuple(got.shape)} 不等元素={bad}/{g.numel()}")
+            print(f"         首个不等位置={idx} 切分值={g[tuple(idx)].item():+.6f} 期望值={e[tuple(idx)].item():+.6f}")
+
+    print("=" * 78)
+    print(f"权重对比检查 当前 rank={tp_rank} 共 {tp_world} 张卡")
+    print(f"参数 num_heads={num_heads} num_groups={num_groups} head_dim={head_dim}")
+    print("=" * 78)
+    print("一、不切分的层(每张卡都持有完整权重,应完全一致)")
+    for hf_k, mg_k in [
+        ("fc.weight", "eagle_module.fc.weight"),
+        ("norm.weight", "eagle_module.decoder.final_layernorm.weight"),
+        ("midlayer.input_layernorm.weight", "eagle_module.enorm.weight"),
+        ("midlayer.hidden_norm.weight", f"{_L0}.input_layernorm.weight"),
+        ("midlayer.post_attention_layernorm.weight", f"{_L0}.pre_mlp_layernorm.weight"),
+    ]:
+        if mg_k in mapped:
+            check(mg_k.replace("eagle_module.", ""), mg_k, hf_state.get(hf_k), hf_k)
+
+    print("-" * 78)
+    print("二、按行切分的层(切 dim=0,rank0 取最前面的行)")
+    hf_lm = hf_state.get("lm_head.weight", hf_state.get("eagle_output_layer.weight"))
+    if hf_lm is not None:
+        s = hf_lm.shape[0] // tp_world
+        check("eagle_output_layer", "eagle_module.eagle_output_layer.weight",
+              hf_lm[tp_rank * s:(tp_rank + 1) * s, :],
+              f"lm_head.weight 第 {tp_rank * s}~{(tp_rank + 1) * s} 行")
+        if tp_rank == 0:
+            print(f"    对照 lm_head 原始首行 {head(hf_lm)}")
+
+    print("-" * 78)
+    print("三、按列切分的层(切 dim=1,每张卡取一段列)")
+    for hf_k, mg_k in [
+        ("midlayer.self_attn.o_proj.weight", f"{_L0}.self_attention.linear_proj.weight"),
+        ("midlayer.mlp.down_proj.weight", f"{_L0}.mlp.linear_fc2.weight"),
+    ]:
+        t = hf_state.get(hf_k)
+        if t is not None:
+            s = t.shape[1] // tp_world
+            check(mg_k.split(".")[-2], mg_k, t[:, tp_rank * s:(tp_rank + 1) * s],
+                  f"{hf_k} 第 {tp_rank * s}~{(tp_rank + 1) * s} 列")
+            if tp_rank == 0:
+                print(f"    对照 {hf_k} 原始首行 {head(t)}")
+    print("-" * 78)
+    print("四、qkv 融合层")
+    q = hf_state.get("midlayer.self_attn.q_proj.weight")
+    k = hf_state.get("midlayer.self_attn.k_proj.weight")
+    v = hf_state.get("midlayer.self_attn.v_proj.weight")
+    mg_qkv = mapped.get(f"{_L0}.self_attention.linear_qkv.weight")
+    if q is not None and k is not None and v is not None:
+        ng_local = num_groups // tp_world
+        rpg = num_heads // num_groups
+        g0 = tp_rank * ng_local
+        print(f"    HF  q 形状={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)}")
+        print(f"    本卡负责 query 组 {g0}~{g0 + ng_local - 1},每组 {rpg} 个 q 头 + 1 个 k 头 + 1 个 v 头")
+        print(f"    HF  q_proj 第 {g0 * rpg * head_dim} 行 {row(q, g0 * rpg * head_dim)}")
+        print(f"    HF  k_proj 第 {g0 * head_dim} 行 {row(k, g0 * head_dim)}")
+        print(f"    HF  v_proj 第 {g0 * head_dim} 行 {row(v, g0 * head_dim)}")
+        if mg_qkv is not None:
+            print(f"    切分 linear_qkv 形状={tuple(mg_qkv.shape)}")
+            print(f"    切分 第 0 行(应等于上面 q_proj 行) {row(mg_qkv, 0)}")
+            print(f"    切分 第 {rpg * head_dim} 行(应等于上面 k_proj 行) {row(mg_qkv, rpg * head_dim)}")
+            print(f"    切分 第 {(rpg + 1) * head_dim} 行(应等于上面 v_proj 行) {row(mg_qkv, (rpg + 1) * head_dim)}")
+        rows = []
+        for g in range(g0, g0 + ng_local):
+            rows.append(q[g * rpg * head_dim:(g + 1) * rpg * head_dim, :])
+            rows.append(k[g * head_dim:(g + 1) * head_dim, :])
+            rows.append(v[g * head_dim:(g + 1) * head_dim, :])
+        check("linear_qkv", f"{_L0}.self_attention.linear_qkv.weight",
+              torch.cat(rows, dim=0), f"q/k/v 按组 {g0}~{g0 + ng_local - 1} 交错拼接")
+        if tp_rank == 0:
+            print(f"    对照 q_proj 原始首行 {head(q)}")
+            print(f"    对照 k_proj 原始首行 {head(k)}")
+            print(f"    对照 v_proj 原始首行 {head(v)}")
+    print("-" * 78)
+    print("五、gate/up 融合层")
+    gate = hf_state.get("midlayer.mlp.gate_proj.weight")
+    up = hf_state.get("midlayer.mlp.up_proj.weight")
+    mg_fc1 = mapped.get(f"{_L0}.mlp.linear_fc1.weight")
+    if gate is not None and up is not None:
+        fl = gate.shape[0] // tp_world
+        gate_local = gate[tp_rank * fl:(tp_rank + 1) * fl, :]
+        up_local = up[tp_rank * fl:(tp_rank + 1) * fl, :]
+        print(f"    HF  gate 形状={tuple(gate.shape)} up={tuple(up.shape)}")
+        print(f"    本卡应持有 gate 第 {tp_rank * fl}~{(tp_rank + 1) * fl} 行 + up 同段")
+        print(f"    HF  gate 第 {tp_rank * fl} 行 {head(gate_local)}")
+        print(f"    HF  up   第 {tp_rank * fl} 行 {head(up_local)}")
+        if mg_fc1 is not None:
+            print(f"    切分 linear_fc1 形状={tuple(mg_fc1.shape)}")
+            print(f"    切分 第 0 行(应等于上面 gate 行) {row(mg_fc1, 0)}")
+            print(f"    切分 第 {fl} 行(应等于上面 up 行) {row(mg_fc1, fl)}")
+        check("linear_fc1", f"{_L0}.mlp.linear_fc1.weight",
+              torch.cat([gate_local, up_local], dim=0),
+              f"gate 与 up 各取第 {tp_rank * fl}~{(tp_rank + 1) * fl} 行后拼接")
+        if tp_rank == 0:
+            print(f"    对照 gate 原始首行 {head(gate)}")
+            print(f"    对照 up   原始首行 {head(up)}")
+
+    print("-" * 78)
+    print("六、词表映射缓冲区")
+    for key in ("d2t", "t2d"):
+        if key in mapped:
+            g, e = mapped[key], hf_state.get(key)
+            same = "完全一致" if (e is not None and bool((g == e).all())) else "不一致"
+            print(f"  [{key}] 形状={tuple(g.shape)} 前 {N} 个={g[:N].tolist()} 结论 {same}")
+    print("=" * 78)
+    # ===== END 权重对比检查_REVERT_20260821 =====
+
+
+    #=================加载到模型=================
+    missing, unexpected = draft.load_state_dict(mapped, strict=False)    # load megatron格式的draft权重在这里实现，真正的加载启动点  
+    # embed_tokens is supplied by the policy later -> drop it from the missing report.
     missing = [k for k in missing if not k.startswith("embed_tokens")]
     world = tp_group.size() if tp_group is not None else _tp_rank_world()[1]
-    
-    
-    # breakpoint()
 
-    # ============================================================================
-    # DRAFT WEIGHT CONVERSION DIAGNOSTIC CODE (inserted after line 487)
-    # 用于诊断 HF 权重转 Megatron 权重过程中可能出现的问题
-    # ============================================================================
-    # from pathlib import Path
+    # DRAFT-WEIGHT-DEBUG: Print loaded Megatron weight statistics
+    print("=" * 80)
+    print(f"DRAFT-WEIGHT-DEBUG: Megatron draft weights loaded")
+    print(f"  Mapped keys: {len(mapped)}")
+    print(f"  Missing keys: {len(missing)}")
+    print(f"  Unexpected keys: {len(unexpected)}")
+    print("-" * 80)
+    print("Mapped weights statistics:")
+    for key in sorted(mapped.keys()):
+        tensor = mapped[key]
+        is_float = tensor.dtype in [torch.float32, torch.bfloat16, torch.float16]
+        print(f"  [MEGATRON] {key}: shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+              f"mean={tensor.float().mean().item() if is_float else 0:.6f} "
+              f"std={tensor.float().std().item() if is_float else 0:.6f}")
+    print("=" * 80)
 
-    # # ===== 第一部分：创建诊断目录 =====
-    # # 在用户目录下创建三个位置：
-    # # 1. hf_weights/ 存放原始 HF 格式权重
-    # # 2. megatron_weights/ 存放转换后的 Megatron 格式权重
-    # # 3. comparison_report.txt 存放详细对比报告
-    # # 文件夹名称包含 draft TP 信息，方便区分不同 TP 配置下的权重
-    # debug_root = Path(f"/home/t00972278/draft_weight_debug_draftTP{world}")
-    # debug_hf_dir = debug_root / "hf_weights"
-    # debug_megatron_dir = debug_root / "megatron_weights"
-    # debug_comparison_file = debug_root / "comparison_report.txt"
+    # DRAFT-WEIGHT-DEBUG: verify d2t/t2d actually landed in the draft buffers.
+    # int64/bool tensors show mean/std=0 above only because that print hard-codes
+    # 0 for non-float dtypes; this block prints raw values to confirm the load.
+    print("=" * 80)
+    print("DRAFT-WEIGHT-DEBUG: d2t/t2d value-level verification (first 5 elems)")
+    loaded_buffers = dict(draft.named_buffers())
+    for key in ("d2t", "t2d"):
+        disk_t = hf_state.get(key)
+        mapped_t = mapped.get(key)
+        buf_t = loaded_buffers.get(key)
+        disk_v = disk_t[:5].tolist() if disk_t is not None else "ABSENT"
+        mapped_v = mapped_t[:5].tolist() if mapped_t is not None else "ABSENT"
+        buf_v = buf_t[:5].tolist() if buf_t is not None else "ABSENT"
+        match = (buf_t is not None and disk_t is not None
+                 and torch.equal(buf_t.cpu(), disk_t.cpu()))
+        print(f"  [{key}] disk(HF)   : {disk_v}")
+        print(f"  [{key}] mapped     : {mapped_v}")
+        print(f"  [{key}] draft.buf  : {buf_v}")
+        print(f"  [{key}] FULL EQUAL disk==buf: {match}")
+    print("=" * 80)
 
-    # debug_hf_dir.mkdir(parents=True, exist_ok=True)
-    # debug_megatron_dir.mkdir(parents=True, exist_ok=True)
+    # DRAFT-WEIGHT-DEBUG: Compare HF original vs Megatron loaded weights (global stats)
+    # For TP-sharded weights, all-gather first; for fused weights, unfuse first
+    print("=" * 80)
+    print("DRAFT-WEIGHT-DEBUG: HF vs Megatron global statistics comparison")
+    print("  (Megatron weights are all-gathered across TP ranks before computing stats)")
+    print("-" * 80)
 
-    # print("=" * 80)
-    # print(f"🔍 DRAFT WEIGHT DIAGNOSTIC (Draft TP={world}): Saving HF and Megatron weights for comparison")
-    # print(f"   HF weights dir: {debug_hf_dir}")
-    # print(f"   Megatron weights dir: {debug_megatron_dir}")
-    # print(f"   Comparison report: {debug_comparison_file}")
-    # print("=" * 80)
+    def _compute_stats(t):
+        """Compute mean, std, min, max, abs_max for a tensor."""
+        t_f = t.float()
+        return {
+            'mean': t_f.mean().item(),
+            'std': t_f.std().item(),
+            'min': t_f.min().item(),
+            'max': t_f.max().item(),
+            'abs_max': t_f.abs().max().item(),
+        }
 
-    # # ===== 第二部分：保存 HF 原始权重 =====
-    # # hf_state 是从磁盘加载的原始 HuggingFace 格式权重
-    # # 例如: {"midlayer.self_attn.q_proj.weight": Tensor([4096, 8192]), ...}
-    # print("\n[1/3] Saving HF weights...")
-    # for key, tensor in hf_state.items():
-    #     # 把权重名字中的特殊字符替换掉，避免文件名非法
-    #     # 例如 "midlayer.self_attn.q_proj.weight" -> "midlayer_self_attn_q_proj_weight"
-    #     safe_key = key.replace("/", "_").replace(".", "_")
-    #     save_path = debug_hf_dir / f"{safe_key}.pt"
-    #     # 保存到 CPU 避免显存占用
-    #     torch.save({"key": key, "tensor": tensor.cpu()}, save_path)
-    #     print(f"  Saved HF: {key} -> {save_path.name}")
+    # Get loaded Megatron state (already in draft model)
+    loaded_state = _target_state(draft)
 
-    # # ===== 第三部分：保存 Megatron 转换后权重 =====
-    # # mapped 是经过 map_hf_to_megatron_draft() 转换后的权重
-    # # 已经完成了融合（QKV、Gate/Up）和 TP 切分
-    # # 例如: {"eagle_module.decoder.layers.0.self_attention.linear_qkv.weight": Tensor([...]), ...}
-    # print("\n[2/3] Saving Megatron weights...")
-    # for key, tensor in mapped.items():
-    #     safe_key = key.replace("/", "_").replace(".", "_")
-    #     save_path = debug_megatron_dir / f"{safe_key}.pt"
-    #     torch.save({"key": key, "tensor": tensor.cpu()}, save_path)
-    #     print(f"  Saved Megatron: {key} -> {save_path.name}")
+    # Layer 1: fc.weight (no TP shard, should be identical)
+    hf_fc = hf_state.get("fc.weight")
+    mg_fc = loaded_state.get("eagle_module.fc.weight")
+    if hf_fc is not None and mg_fc is not None:
+        hf_fc_stats = _compute_stats(hf_fc)
+        mg_fc_stats = _compute_stats(mg_fc)
+        print(f"fc.weight (NO TP shard, should be identical):")
+        print(f"  HF:       mean={hf_fc_stats['mean']:.6f} std={hf_fc_stats['std']:.6f} "
+              f"min={hf_fc_stats['min']:.6f} max={hf_fc_stats['max']:.6f} abs_max={hf_fc_stats['abs_max']:.6f}")
+        print(f"  Megatron: mean={mg_fc_stats['mean']:.6f} std={mg_fc_stats['std']:.6f} "
+              f"min={mg_fc_stats['min']:.6f} max={mg_fc_stats['max']:.6f} abs_max={mg_fc_stats['abs_max']:.6f}")
+        print(f"  MATCH: {torch.allclose(hf_fc.cpu(), mg_fc.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    # # ===== 第四部分：逐层对比权重 =====
-    # print("\n[3/3] Comparing weights...")
-    # comparison_lines = []  # 存储对比报告的每一行
-    # comparison_lines.append("=" * 80)
-    # comparison_lines.append("DRAFT WEIGHT CONVERSION COMPARISON REPORT")
-    # comparison_lines.append(f"TP world size: {world}")  # TP 并行度，例如 tp=8
-    # comparison_lines.append(f"num_heads={num_heads}, num_groups={num_groups}, head_dim={head_dim}")
-    # comparison_lines.append("=" * 80)
+    # Layer 2: linear_qkv (TP sharded, need gather + unfuse)
+    mg_qkv_sharded = loaded_state.get(f"{_L0}.self_attention.linear_qkv.weight")
+    if mg_qkv_sharded is not None:
+        mg_qkv_gathered = _gather_tp_weight(mg_qkv_sharded, dim=0, group=tp_group)
+        q_mg, k_mg, v_mg = _unfuse_qkv_from_megatron(mg_qkv_gathered, num_heads, num_groups, head_dim)
 
-    # # 定义对比函数：计算两个 tensor 的差异统计
-    # def compare_tensors(name, hf_tensor, meg_tensor, tolerance=1e-5):
-    #     """
-    #     对比两个 tensor，输出形状、均值、标准差、最大差异
+        q_hf = hf_state.get("midlayer.self_attn.q_proj.weight")
+        k_hf = hf_state.get("midlayer.self_attn.k_proj.weight")
+        v_hf = hf_state.get("midlayer.self_attn.v_proj.weight")
 
-    #     参数:
-    #         name: 权重层的名字（用于报告）
-    #         hf_tensor: HF 格式的 tensor
-    #         meg_tensor: Megatron 格式的 tensor
-    #         tolerance: 容差阈值，超过视为警告
+        if q_hf is not None and q_mg is not None:
+            q_hf_stats = _compute_stats(q_hf)
+            q_mg_stats = _compute_stats(q_mg)
+            print(f"q_proj.weight (TP sharded, gathered):")
+            print(f"  HF:       mean={q_hf_stats['mean']:.6f} std={q_hf_stats['std']:.6f} "
+                  f"min={q_hf_stats['min']:.6f} max={q_hf_stats['max']:.6f} abs_max={q_hf_stats['abs_max']:.6f}")
+            print(f"  Megatron: mean={q_mg_stats['mean']:.6f} std={q_mg_stats['std']:.6f} "
+                  f"min={q_mg_stats['min']:.6f} max={q_mg_stats['max']:.6f} abs_max={q_mg_stats['abs_max']:.6f}")
+            print(f"  MATCH: {torch.allclose(q_hf.cpu(), q_mg.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    #     返回: 格式化的对比字符串
-    #     """
-    #     # 检查形状是否匹配
-    #     if hf_tensor.shape != meg_tensor.shape:
-    #         return f"❌ {name}: SHAPE MISMATCH! HF={hf_tensor.shape} vs Megatron={meg_tensor.shape}"
+        if k_hf is not None and k_mg is not None:
+            k_hf_stats = _compute_stats(k_hf)
+            k_mg_stats = _compute_stats(k_mg)
+            print(f"k_proj.weight (TP sharded, gathered):")
+            print(f"  HF:       mean={k_hf_stats['mean']:.6f} std={k_hf_stats['std']:.6f} "
+                  f"min={k_hf_stats['min']:.6f} max={k_hf_stats['max']:.6f} abs_max={k_hf_stats['abs_max']:.6f}")
+            print(f"  Megatron: mean={k_mg_stats['mean']:.6f} std={k_mg_stats['std']:.6f} "
+                  f"min={k_mg_stats['min']:.6f} max={k_mg_stats['max']:.6f} abs_max={k_mg_stats['abs_max']:.6f}")
+            print(f"  MATCH: {torch.allclose(k_hf.cpu(), k_mg.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    #     # 计算逐元素的绝对差异
-    #     diff = (hf_tensor.float() - meg_tensor.float()).abs()
-    #     max_diff = diff.max().item()      # 最大差异
-    #     mean_diff = diff.mean().item()    # 平均差异
+        if v_hf is not None and v_mg is not None:
+            v_hf_stats = _compute_stats(v_hf)
+            v_mg_stats = _compute_stats(v_mg)
+            print(f"v_proj.weight (TP sharded, gathered):")
+            print(f"  HF:       mean={v_hf_stats['mean']:.6f} std={v_hf_stats['std']:.6f} "
+                  f"min={v_hf_stats['min']:.6f} max={v_hf_stats['max']:.6f} abs_max={v_hf_stats['abs_max']:.6f}")
+            print(f"  Megatron: mean={v_mg_stats['mean']:.6f} std={v_mg_stats['std']:.6f} "
+                  f"min={v_mg_stats['min']:.6f} max={v_mg_stats['max']:.6f} abs_max={v_mg_stats['abs_max']:.6f}")
+            print(f"  MATCH: {torch.allclose(v_hf.cpu(), v_mg.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    #     # 如果最大差异小于容差，标记为 ✅，否则标记为 ⚠️
-    #     status = "✅" if max_diff < tolerance else "⚠️"
-    #     return (f"{status} {name}:\n"
-    #             f"     Shape: {tuple(hf_tensor.shape)}\n"
-    #             f"     HF    - mean: {hf_tensor.float().mean():.6f}, std: {hf_tensor.float().std():.6f}\n"
-    #             f"     Mega  - mean: {meg_tensor.float().mean():.6f}, std: {meg_tensor.float().std():.6f}\n"
-    #             f"     Diff  - max: {max_diff:.6e}, mean: {mean_diff:.6e}")
+    # Layer 3: linear_fc1 (gate+up fused, TP sharded)
+    mg_fc1_sharded = loaded_state.get(f"{_L0}.mlp.linear_fc1.weight")
+    if mg_fc1_sharded is not None:
+        mg_fc1_gathered = _gather_tp_weight(mg_fc1_sharded, dim=0, group=tp_group)
+        gate_mg, up_mg = _unfuse_gate_up(mg_fc1_gathered, world=_export_tp_world(tp_group))
 
-    # # ----- 4.1 对比直接映射的层（无融合，无 TP 切分） -----
-    # # 这些层是 1:1 映射，不需要做任何变换
-    # # 例如：LayerNorm、fc 这些层在所有 rank 上都是完整复制的
-    # comparison_lines.append("\n--- Direct Mappings (No Fusion) ---")
-    # direct_map = {
-    #     # HF 键名 -> Megatron 键名
-    #     "fc.weight": "eagle_module.fc.weight",
-    #     "norm.weight": "eagle_module.decoder.final_layernorm.weight",
-    #     "midlayer.input_layernorm.weight": "eagle_module.enorm.weight",
-    #     "midlayer.hidden_norm.weight": f"{_L0}.input_layernorm.weight",
-    #     "midlayer.post_attention_layernorm.weight": f"{_L0}.pre_mlp_layernorm.weight",
-    # }
+        gate_hf = hf_state.get("midlayer.mlp.gate_proj.weight")
+        up_hf = hf_state.get("midlayer.mlp.up_proj.weight")
 
-    # for hf_key, meg_key in direct_map.items():
-    #     if hf_key in hf_state and meg_key in mapped:
-    #         # 直接对比，应该完全一致（除了可能的精度转换）
-    #         result = compare_tensors(hf_key, hf_state[hf_key], mapped[meg_key])
-    #         comparison_lines.append(result)
+        if gate_hf is not None and gate_mg is not None:
+            gate_hf_stats = _compute_stats(gate_hf)
+            gate_mg_stats = _compute_stats(gate_mg)
+            print(f"gate_proj.weight (TP sharded, gathered):")
+            print(f"  HF:       mean={gate_hf_stats['mean']:.6f} std={gate_hf_stats['std']:.6f} "
+                  f"min={gate_hf_stats['min']:.6f} max={gate_hf_stats['max']:.6f} abs_max={gate_hf_stats['abs_max']:.6f}")
+            print(f"  Megatron: mean={gate_mg_stats['mean']:.6f} std={gate_mg_stats['std']:.6f} "
+                  f"min={gate_mg_stats['min']:.6f} max={gate_mg_stats['max']:.6f} abs_max={gate_mg_stats['abs_max']:.6f}")
+            print(f"  MATCH: {torch.allclose(gate_hf.cpu(), gate_mg.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    # # ----- 4.2 对比 TP 切分的层（按维度切分，但无融合） -----
-    # # 这些层被切分到多个 rank 上，每个 rank 只持有一部分
-    # # 需要从 HF 完整权重中提取出当前 rank 的那一片，然后再对比
-    # comparison_lines.append("\n--- TP-Sharded Weights (Compare Sharded Slice) ---")
-    # comparison_lines.append("NOTE: Megatron weights are TP-sharded; comparing THIS rank's slice only")
+        if up_hf is not None and up_mg is not None:
+            up_hf_stats = _compute_stats(up_hf)
+            up_mg_stats = _compute_stats(up_mg)
+            print(f"up_proj.weight (TP sharded, gathered):")
+            print(f"  HF:       mean={up_hf_stats['mean']:.6f} std={up_hf_stats['std']:.6f} "
+                  f"min={up_hf_stats['min']:.6f} max={up_hf_stats['max']:.6f} abs_max={up_hf_stats['abs_max']:.6f}")
+            print(f"  Megatron: mean={up_mg_stats['mean']:.6f} std={up_mg_stats['std']:.6f} "
+                  f"min={up_mg_stats['min']:.6f} max={up_mg_stats['max']:.6f} abs_max={up_mg_stats['abs_max']:.6f}")
+            print(f"  MATCH: {torch.allclose(up_hf.cpu(), up_mg.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    # # 行并行层：权重在 dim=1 上切分（输出维度切分）
-    # # 例如：o_proj 和 down_proj
-    # row_parallel_map = {
-    #     "midlayer.self_attn.o_proj.weight": f"{_L0}.self_attention.linear_proj.weight",
-    #     "midlayer.mlp.down_proj.weight": f"{_L0}.mlp.linear_fc2.weight",
-    # }
-    # for hf_key, meg_key in row_parallel_map.items():
-    #     if hf_key in hf_state and meg_key in mapped:
-    #         hf_full = hf_state[hf_key]      # HF 的完整权重
-    #         meg_shard = mapped[meg_key]     # Megatron 的切分后权重（仅当前 rank）
+    # Layer 4: linear_proj (o_proj, TP sharded on dim=1 - row parallel)
+    mg_proj_sharded = loaded_state.get(f"{_L0}.self_attention.linear_proj.weight")
+    if mg_proj_sharded is not None:
+        mg_proj_gathered = _gather_tp_weight(mg_proj_sharded, dim=1, group=tp_group)
+        o_hf = hf_state.get("midlayer.self_attn.o_proj.weight")
 
-    #         # 获取当前 rank 编号
-    #         rank, _ = _tp_rank_world() if tp_group is None else (tp_group.rank(), tp_group.size())
+        if o_hf is not None:
+            o_hf_stats = _compute_stats(o_hf)
+            o_mg_stats = _compute_stats(mg_proj_gathered)
+            print(f"o_proj.weight (TP sharded dim=1, gathered):")
+            print(f"  HF:       mean={o_hf_stats['mean']:.6f} std={o_hf_stats['std']:.6f} "
+                  f"min={o_hf_stats['min']:.6f} max={o_hf_stats['max']:.6f} abs_max={o_hf_stats['abs_max']:.6f}")
+            print(f"  Megatron: mean={o_mg_stats['mean']:.6f} std={o_mg_stats['std']:.6f} "
+                  f"min={o_mg_stats['min']:.6f} max={o_mg_stats['max']:.6f} abs_max={o_mg_stats['abs_max']:.6f}")
+            print(f"  MATCH: {torch.allclose(o_hf.cpu(), mg_proj_gathered.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    #         # 从 HF 完整权重中提取当前 rank 对应的切片
-    #         # 例如：TP=8, rank=3, 则取第 3 块（共 8 块）
-    #         hf_shard = torch.chunk(hf_full, world, dim=1)[rank]
+    # Layer 5: linear_fc2 (down_proj, TP sharded on dim=1 - row parallel)
+    mg_fc2_sharded = loaded_state.get(f"{_L0}.mlp.linear_fc2.weight")
+    if mg_fc2_sharded is not None:
+        mg_fc2_gathered = _gather_tp_weight(mg_fc2_sharded, dim=1, group=tp_group)
+        down_hf = hf_state.get("midlayer.mlp.down_proj.weight")
 
-    #         # 对比 HF 的切片和 Megatron 的切片，应该一致
-    #         result = compare_tensors(f"{hf_key} [rank={rank}, dim=1]", hf_shard, meg_shard)
-    #         comparison_lines.append(result)
+        if down_hf is not None:
+            down_hf_stats = _compute_stats(down_hf)
+            down_mg_stats = _compute_stats(mg_fc2_gathered)
+            print(f"down_proj.weight (TP sharded dim=1, gathered):")
+            print(f"  HF:       mean={down_hf_stats['mean']:.6f} std={down_hf_stats['std']:.6f} "
+                  f"min={down_hf_stats['min']:.6f} max={down_hf_stats['max']:.6f} abs_max={down_hf_stats['abs_max']:.6f}")
+            print(f"  Megatron: mean={down_mg_stats['mean']:.6f} std={down_mg_stats['std']:.6f} "
+                  f"min={down_mg_stats['min']:.6f} max={down_mg_stats['max']:.6f} abs_max={down_mg_stats['abs_max']:.6f}")
+            print(f"  MATCH: {torch.allclose(down_hf.cpu(), mg_fc2_gathered.cpu(), rtol=1e-5, atol=1e-6)}")
 
-    # # 列并行层：权重在 dim=0 上切分（输入维度切分）
-    # # 例如：lm_head (eagle_output_layer)
-    # if "lm_head.weight" in hf_state and "eagle_module.eagle_output_layer.weight" in mapped:
-    #     hf_full = hf_state["lm_head.weight"]
-    #     meg_shard = mapped["eagle_module.eagle_output_layer.weight"]
-    #     rank, _ = _tp_rank_world() if tp_group is None else (tp_group.rank(), tp_group.size())
-
-    #     # 在 dim=0 上切分
-    #     hf_shard = torch.chunk(hf_full, world, dim=0)[rank]
-    #     result = compare_tensors(f"lm_head.weight [rank={rank}, dim=0]", hf_shard, meg_shard)
-    #     comparison_lines.append(result)
-
-    # # ----- 4.3 对比 QKV 融合层（最复杂） -----
-    # # HF: 三个独立的权重 q_proj, k_proj, v_proj
-    # # Megatron: 融合成一个 linear_qkv，并且是 interleaved 布局，还要 TP 切分
-    # #
-    # # 验证方法：手动用 HF 的 q/k/v 重新融合一次，看是否和 mapped 里的一致
-    # comparison_lines.append("\n--- QKV Fusion Verification ---")
-    # q_hf = hf_state.get("midlayer.self_attn.q_proj.weight")
-    # k_hf = hf_state.get("midlayer.self_attn.k_proj.weight")
-    # v_hf = hf_state.get("midlayer.self_attn.v_proj.weight")
-    # qkv_meg = mapped.get(f"{_L0}.self_attention.linear_qkv.weight")
-
-    # if all(x is not None for x in [q_hf, k_hf, v_hf, qkv_meg]):
-    #     # 重新调用融合函数，模拟转换过程
-    #     target = model_state.get(f"{_L0}.self_attention.linear_qkv.weight")
-    #     qkv_fused_sharded = _fuse_and_shard_qkv(q_hf, k_hf, v_hf, num_heads, num_groups, head_dim, target)
-
-    #     # 对比重新融合的结果和 mapped 里的结果
-    #     # 如果一致，说明融合逻辑没问题；如果不一致，说明融合过程有 bug
-    #     result = compare_tensors("QKV (fused+sharded)", qkv_fused_sharded, qkv_meg)
-    #     comparison_lines.append(result)
-    # else:
-    #     comparison_lines.append("❌ QKV: Missing components")
-
-    # # ----- 4.4 对比 Gate/Up 融合层 -----
-    # # HF: 两个独立的权重 gate_proj, up_proj
-    # # Megatron: 融合成一个 linear_fc1，布局是 [gate_local; up_local] per rank
-    # #
-    # # 验证方法：手动用 HF 的 gate/up 重新融合一次，看是否和 mapped 里的一致
-    # comparison_lines.append("\n--- Gate/Up Fusion Verification ---")
-    # gate_hf = hf_state.get("midlayer.mlp.gate_proj.weight")
-    # up_hf = hf_state.get("midlayer.mlp.up_proj.weight")
-    # fc1_meg = mapped.get(f"{_L0}.mlp.linear_fc1.weight")
-
-    # if all(x is not None for x in [gate_hf, up_hf, fc1_meg]):
-    #     # 重新调用融合函数，模拟转换过程
-    #     target = model_state.get(f"{_L0}.mlp.linear_fc1.weight")
-    #     fc1_fused_sharded = _shard_gate_up(gate_hf, up_hf, target)
-
-    #     # 对比重新融合的结果和 mapped 里的结果
-    #     # 如果一致，说明融合逻辑没问题；如果不一致，说明融合过程有 bug
-    #     result = compare_tensors("Gate/Up (fused+sharded)", fc1_fused_sharded, fc1_meg)
-    #     comparison_lines.append(result)
-    # else:
-    #     comparison_lines.append("❌ Gate/Up: Missing components")
-
-    # # ===== 第五部分：保存对比报告到文件 =====
-    # comparison_lines.append("\n" + "=" * 80)
-    # comparison_lines.append("END OF COMPARISON REPORT")
-    # comparison_lines.append("=" * 80)
-
-    # report_text = "\n".join(comparison_lines)
-    # with open(debug_comparison_file, "w") as f:
-    #     f.write(report_text)
-
-    # # 打印报告到终端
-    # print(report_text)
-    # print(f"\n✅ Diagnostic complete! Files saved to {debug_root}")
-    # print(f"   - HF weights: {len(list(debug_hf_dir.glob('*.pt')))} files")
-    # print(f"   - Megatron weights: {len(list(debug_megatron_dir.glob('*.pt')))} files")
-    # print(f"   - Comparison report: {debug_comparison_file}")
-    # print("=" * 80)
-    # ============================================================================
-    # END OF DIAGNOSTIC CODE
-    # ============================================================================
-
-    # breakpoint()
+    print("=" * 80)
 
     logger.warning(
         "eagle3: loaded MEGATRON draft weights (tp=%d, mapped=%d, missing=%d, unexpected=%d)",
@@ -712,3 +846,13 @@ def load_megatron_draft_weights(draft, draft_path: str, tp_group=None) -> None:
         logger.warning("eagle3: draft missing keys after load: %s", missing)
     if unexpected:
         logger.warning("eagle3: draft unexpected keys after load: %s", unexpected)
+
+    # ===== DRAFT_LOAD_PROBE_REVERT_20260821 (调试用,回退时删除本块) =====
+    # 主动抛异常:确认本函数确实被执行,并让 traceback 钉死调用链与真身文件路径。
+    # raise RuntimeError(
+    #     f"[DRAFT_LOAD_PROBE] load_megatron_draft_weights executed -> "
+    #     f"draft_path={draft_path}, tp={world}, mapped={len(mapped)}, "
+    #     f"missing={len(missing)} ({missing}), unexpected={len(unexpected)} ({unexpected}); "
+    #     f"__file__={__file__}"
+    # )
+    # ===== END DRAFT_LOAD_PROBE_REVERT_20260821 =====

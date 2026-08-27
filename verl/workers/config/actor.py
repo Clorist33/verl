@@ -152,6 +152,14 @@ class ActorConfig(BaseConfig):
     ppo_micro_batch_size: Optional[int] = None  # deprecate
     ppo_micro_batch_size_per_gpu: Optional[int] = None
     ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
+
+    # === Draft 专用参数（可选，用于串行训练）===
+    # 如果不设置，Draft 将使用 Actor 的参数（向后兼容）
+    draft_ppo_mini_batch_size: Optional[int] = None
+    draft_ppo_micro_batch_size: Optional[int] = None  # deprecate
+    draft_ppo_micro_batch_size_per_gpu: Optional[int] = None
+    draft_ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
+
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384

@@ -133,7 +133,7 @@ USE_MEGATRON_DRAFT=${USE_MEGATRON_DRAFT:-True}
 #   <n>         = force draft TP = n (must divide BOTH policy TP and num_query_groups);
 #                 n < policy_tp builds a dedicated draft TP sub-group (PP=1/CP=1 only).
 DRAFT_TP=${DRAFT_TP:-4}
-DRAFT_LR=${DRAFT_LR:-1e-4}
+DRAFT_LR=${DRAFT_LR:-1e-6}
 LOSS_WEIGHT=${LOSS_WEIGHT:-1.0}
 NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
 # This draft IS vocab-compressed: draft_vocab_size=32000 vs policy vocab 151936.
@@ -155,8 +155,8 @@ max_response_length=${MAX_RESPONSE_LENGTH:-8192}  # OOM: 长序列 → gather �
 
 
 # ====batch-size====
-train_prompt_bsz=${TRAIN_BATCH_SIZE:-4}            #代表的是
-train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-1}     
+train_prompt_bsz=${TRAIN_BATCH_SIZE:-32}            #代表的是
+train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-4}     
 ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
 
 

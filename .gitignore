@@ -131,3 +131,8 @@ logs
 log
 outputs
 .history
+vllm-ascend.shadowed_checkout_bak/
+vllm.shadowed_checkout_bak/
+examples/eagle3/extra-info/
+*.o
+*.bak*
