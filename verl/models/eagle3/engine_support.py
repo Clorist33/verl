@@ -379,6 +379,10 @@ class Eagle3TrainingState:
         self.capture = None
         self.enabled = False
         self.optim_offload = False     # keep draft AdamW state on CPU between steps
+        # v3 deferred training: read-only lm_head snapshot used to rebuild teacher
+        # logits from stashed hidden states, refreshed once per draft-training step
+        # by refresh_frozen_teacher_head(). None whenever deferred training is off.
+        self.frozen_lm_head = None
 
 
 def _inject_and_freeze_draft_embed(draft_raw, gpt) -> bool:

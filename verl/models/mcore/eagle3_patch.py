@@ -167,6 +167,32 @@ def unpatch_eagle3_postprocess(model: torch.nn.Module):
             delattr(m, attr)
 
 # ========================================draft-loss的入口========================================
+def stash_draft_loss(model: torch.nn.Module, loss: torch.Tensor) -> bool:
+    """Stash one draft loss for ``drain_draft_losses`` to collect. Returns success.
+
+    Pairs with :func:`drain_draft_losses` and resolves the owning module the same
+    way, so a producer cannot stash onto a different object than the drain reads
+    from. The in-forward path appends to ``self._eagle3_draft_losses`` directly --
+    ``self`` is already the patched model, so it cannot get this wrong. Deferred
+    training starts from the engine instead and reaches the model through
+    ``_unwrap_gpt``, which resolves independently of ``_get_patching_model``;
+    when the two disagree the loss is stashed where nobody drains it, the draft
+    never backwards, and nothing raises.
+    """
+    m = _get_patching_model(model)
+    if m is None:
+        logger.error(
+            "eagle3_patch: cannot stash draft loss -- %s did not resolve to a patched "
+            "model, so the loss would be dropped and the draft would silently not train.",
+            type(model).__name__,
+        )
+        return False
+    if not hasattr(m, "_eagle3_draft_losses"):
+        m._eagle3_draft_losses = []
+    m._eagle3_draft_losses.append(loss)
+    return True
+
+
 def drain_draft_losses(model: torch.nn.Module) -> List[torch.Tensor]:
     """Pop all stashed per-microbatch draft losses (engine calls after forward)."""
     m = _get_patching_model(model)
