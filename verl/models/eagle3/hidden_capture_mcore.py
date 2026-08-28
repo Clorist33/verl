@@ -138,19 +138,73 @@ class Eagle3HiddenCapture:
         self.detach = detach
         self._captured = {}          # layer_id -> tensor
         self._handles = []           # hook handles
+        self._row_index = None       # None -> keep every row; else (rows,) long
         for i in self.capture_layer_ids:
             if i < 0 or i >= self.num_layers:
                 raise ValueError(
                     f"Eagle3HiddenCapture: layer id {i} out of range [0, {self.num_layers})"
                 )
 
+    def set_row_index(self, row_index):
+        """Harvest only ``row_index`` sequence positions instead of the whole sequence.
+
+        The full aux hidden is (S, B, H*num_aux); at S~6k, H=4096, num_aux=3 that is
+        ~145 MB per sequence, which the deferred-training design cannot afford to
+        stash (see 开发设计/串行训练/方案设计：SpeCo式采集与延后训练_v3.md §2).
+        Slicing inside the hook keeps only the rows a
+        :class:`~verl.models.eagle3.collect_plan.CollectPlan` asked for, so the
+        stash cost scales with rows-used rather than sequence length.
+
+        Slicing happens BEFORE ``detach()``, so the dropped rows become garbage as
+        soon as the layer's output goes out of scope.
+
+        NOTE: indices address the tensor the hook observes. Under sequence
+        parallelism each rank holds only S/TP rows, so callers must pass
+        rank-local indices (or gather first) -- this class does no coordinate
+        translation and will raise if an index is out of range.
+
+        Args:
+            row_index: 1-D LongTensor of positions, or ``None`` to restore
+                full-sequence capture.
+        """
+        if row_index is None:
+            self._row_index = None
+            return self
+        if not isinstance(row_index, torch.Tensor):
+            row_index = torch.as_tensor(row_index, dtype=torch.long)
+        if row_index.dim() != 1:
+            raise ValueError(f"row_index must be 1-D, got shape {tuple(row_index.shape)}")
+        self._row_index = row_index.to(torch.long)
+        return self
+
+    @property
+    def row_index(self):
+        """Active row selection, or ``None`` when capturing the full sequence."""
+        return self._row_index
+
     def _make_hook(self, layer_id: int):
         def hook(module, inputs, output):
             # Megatron TransformerLayer returns (hidden_states, context); plain
             # nn.Module may return a bare tensor.
             hs = output[0] if isinstance(output, (tuple, list)) else output
+            if self._row_index is not None:
+                # (S, B, H) -> (rows, B, H). Select before detach so the dropped
+                # rows are freed with the layer output.
+                idx = self._row_index
+                if idx.device != hs.device:
+                    idx = idx.to(hs.device)
+                    self._row_index = idx
+                if idx.numel() and int(idx.max()) >= hs.shape[0]:
+                    raise IndexError(
+                        f"Eagle3HiddenCapture: row index {int(idx.max())} out of range for "
+                        f"layer {layer_id} output with {hs.shape[0]} sequence positions. "
+                        "Under sequence_parallel each rank holds only S/TP rows -- pass "
+                        "rank-local indices or gather before selecting."
+                    )
+                hs = hs.index_select(0, idx)
             self._captured[layer_id] = hs.detach() if self.detach else hs
         return hook
+
 
     def register(self):
         """Attach forward hooks. Idempotent-ish: call remove() before re-register."""
