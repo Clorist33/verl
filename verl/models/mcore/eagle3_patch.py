@@ -143,6 +143,7 @@ def patch_eagle3_postprocess(
     m._postprocess = _megatron_gptmodel_postprocess_eagle3.__get__(m, m.__class__)
 
     # 绑定串行训练相关的三个方法到模型实例
+    m._eagle3_collect_features_step = _eagle3_collect_features_step.__get__(m, m.__class__)
     m._eagle3_parallel_training = _eagle3_parallel_training.__get__(m, m.__class__)
     m._eagle3_actor_only_step = _eagle3_actor_only_step.__get__(m, m.__class__)
     m._eagle3_draft_training_step = _eagle3_draft_training_step.__get__(m, m.__class__)
@@ -162,7 +163,9 @@ def unpatch_eagle3_postprocess(model: torch.nn.Module):
         del m._postprocess_backup_eagle3
     for attr in ("_eagle3_draft", "_eagle3_capture", "_eagle3_ttt_length",
                  "_eagle3_gamma", "_eagle3_temperature", "_eagle3_draft_losses",
-                 "_eagle3_parallel_training", "_eagle3_actor_only_step", "_eagle3_draft_training_step"):
+                 "_eagle3_parallel_training", "_eagle3_actor_only_step", "_eagle3_draft_training_step",
+                 "_eagle3_collect_features_step", "_eagle3_collect_only", "_eagle3_feature_store",
+                 "_eagle3_collect_config"):
         if hasattr(m, attr):
             delattr(m, attr)
 
@@ -269,7 +272,14 @@ def _megatron_gptmodel_postprocess_eagle3(
     train_draft_only = getattr(self, "_eagle3_train_draft_only", False)
     enable_draft_training = getattr(self, "_eagle3_enable_draft_training", True)
 
-    if train_draft_only:
+    if getattr(self, "_eagle3_collect_only", False):
+        # === v3 延后训练：只采集特征，不在本次前向里训 draft ===
+        # 挂在 compute_log_prob 那次前向上（PPO 本来就要跑），把 draft 训练需要的
+        # hidden 采下来存到 host，真正的训练在 update_actor 返回之后进行。
+        return self._eagle3_collect_features_step(
+            hidden_states, input_ids, position_ids, loss_mask, runtime_gather_output
+        )
+    elif train_draft_only:
         # === 串行模式：Draft 训练步（只训练 draft）===
         return self._eagle3_draft_training_step(
             hidden_states, input_ids, position_ids, labels, rotary_pos_emb,
@@ -401,6 +411,126 @@ def _eagle3_draft_forward_and_stash_loss(
         self._eagle3_draft_losses = []
     self._eagle3_draft_losses.append(loss_out["loss"])
     return loss_out
+
+
+def lens_from_loss_mask(loss_mask: torch.Tensor):
+    """Derive per-sample ``(prompt_len, response_len)`` from a ``(B, S)`` loss mask.
+
+    The collect plan needs both, but neither is handed to ``_postprocess`` --
+    only ``loss_mask``, which is True exactly on the response tokens the policy
+    loss covers. That is enough: the first True is where the response starts, and
+    the count of Trues is its length.
+
+    ``prompt_len`` is returned as the first response position, so
+    ``build_collect_plan``'s ``start = prompt_len - 1`` lands on the last prompt
+    token -- the hidden that predicts response[0].
+
+    Samples with an all-False row get ``(0, 0)`` and are dropped by the plan's
+    length gate rather than producing a bogus window.
+    """
+    if loss_mask.dim() == 1:
+        loss_mask = loss_mask.unsqueeze(0)
+    mask = loss_mask.bool()
+    response_lens = mask.sum(dim=1).to(torch.long)
+    has_any = response_lens > 0
+    # argmax on a bool row returns the first True; meaningless for all-False rows,
+    # which has_any then zeroes out.
+    first_true = mask.to(torch.uint8).argmax(dim=1).to(torch.long)
+    prompt_lens = torch.where(has_any, first_true, torch.zeros_like(first_true))
+    response_lens = torch.where(has_any, response_lens, torch.zeros_like(response_lens))
+    return prompt_lens.cpu(), response_lens.cpu()
+
+
+def _eagle3_collect_features_step(
+    self,
+    hidden_states,
+    input_ids,
+    position_ids,
+    loss_mask,
+    runtime_gather_output,
+):
+    """v3 deferred training: harvest draft features, train nothing here.
+
+    Runs on the ``compute_log_prob`` forward, which PPO pays for anyway. The
+    policy return path is byte-identical to the other branches -- the draft side
+    only reads, and everything it reads is detached.
+
+    Failures are swallowed with an ERROR, following the parallel path's stance:
+    this branch rides a forward the policy needs, so breaking it would take down
+    old_log_probs over a draft-side problem. A step that collects nothing is not
+    silent either way -- ``train_draft_from_store`` warns on an empty store.
+    """
+    output_weight = None
+    if self.share_embeddings_and_output_weights:
+        output_weight = self.shared_embedding_or_output_weight()
+
+    if not self.post_process:
+        return hidden_states
+
+    logits, _ = self.output_layer(hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
+    logits = logits.transpose(0, 1).contiguous()  # [s b h] -> [b s h]
+
+    store = getattr(self, "_eagle3_feature_store", None)
+    capture = getattr(self, "_eagle3_capture", None)
+    if store is None or capture is None or loss_mask is None:
+        logger.warning(
+            "eagle3_patch: collect-only step skipped (store=%s capture=%s loss_mask=%s)",
+            store is not None, capture is not None, loss_mask is not None,
+        )
+        return logits
+
+    try:
+        from verl.models.eagle3.collect_plan import build_collect_plan
+        from verl.models.eagle3.feature_store import collect_draft_features
+
+        cfg = getattr(self, "_eagle3_collect_config", None) or {}
+        prompt_lens, response_lens = lens_from_loss_mask(loss_mask)
+        plan = build_collect_plan(
+            prompt_lens=prompt_lens,
+            response_lens=response_lens,
+            global_step=cfg.get("global_step", 0),
+            window_train_rows=cfg.get("window_train_rows", 512),
+            window_mode=cfg.get("window_mode", "front"),
+            sample_rate=cfg.get("sample_rate", 1.0),
+            max_samples_per_replica=cfg.get("max_samples_per_replica", 16),
+            max_tokens_per_replica=cfg.get("max_tokens_per_replica", 16384),
+        )
+        if plan is None:
+            return logits
+
+        # aux comes from the capture hooks (already detached); final_hidden is the
+        # pre-lm_head activation this function was handed. Both are still
+        # sequence-parallel sharded here -- collect_draft_features gathers them,
+        # because the plan addresses global positions.
+        stored = collect_draft_features(
+            store=store,
+            aux_hidden=capture.get_captured(seqlen_first=True),
+            final_hidden=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            loss_mask=loss_mask,
+            plan=plan,
+            global_step=cfg.get("global_step", 0),
+            sequence_parallel=getattr(self.config, "sequence_parallel", False),
+            tp_world_size=_eagle3_tp_world_size(),
+        )
+        logger.warning(
+            "[DRAFT-COLLECT] step %s: stashed %d/%d window(s) (%d candidates)",
+            cfg.get("global_step", 0), stored, plan.selected_count, plan.candidate_count,
+        )
+    except Exception as e:
+        logger.error(
+            "eagle3_patch: feature collection failed (%r). old_log_probs is unaffected; "
+            "the draft simply has nothing to train on this step.",
+            e, exc_info=True,
+        )
+        if _eagle3_strict_draft():
+            raise
+    finally:
+        if capture is not None:
+            capture.clear()
+
+    return logits
 
 
 def _eagle3_parallel_training(
