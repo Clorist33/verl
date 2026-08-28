@@ -533,18 +533,12 @@ class PPOTrainer(ABC):
             # === 更新进度条，显示当前步数和训练类型 ===
             if hasattr(self, '_current_training_type'):
                 # 串行训练模式：显示 global_steps 和 actor_steps/draft_steps
-                if self._current_training_type == "Actor":
-                    progress_desc = (
-                        f"Global {self.global_steps}/{self.total_training_steps} "
-                        f"[Actor {self.actor_steps}/{self.actor_training_steps}]"
-                    )
-                elif self._current_training_type == "Draft":
-                    progress_desc = (
-                        f"Global {self.global_steps}/{self.total_training_steps} "
-                        f"[Draft {self.draft_steps}/{self.draft_training_steps}]"
-                    )
-                else:
-                    progress_desc = f"Step {self.global_steps}"
+                progress_desc = (
+                    f"Global {self.global_steps}/{self.total_training_steps} "
+                    f"[Actor {self.actor_steps}/{self.actor_training_steps}]"
+                )
+                if self._current_training_type == "Actor+Draft":
+                    progress_desc += f" [Draft {self.draft_steps}/{self.draft_training_steps}]"
             else:
                 # 并行训练模式：只显示步数
                 progress_desc = f"Step {self.global_steps}"
@@ -779,12 +773,9 @@ class PPOTrainer(ABC):
         train_draft = self._serial_scheduler.should_train_draft(self.global_steps)
 
         # === 记录当前步骤类型（用于进度条显示）===
-        if train_actor:
-            self._current_training_type = "Actor"
-        elif train_draft:
-            self._current_training_type = "Draft"
-        else:
-            self._current_training_type = "Unknown"
+        # v3 没有「Draft 步」了：每一步都是 Actor 步，第 k 步额外带上 draft。
+        # 旧的三分支里 "Draft"/"Unknown" 现在都不可达（should_train_actor 恒 True）。
+        self._current_training_type = "Actor+Draft" if train_draft else "Actor"
 
         logger.debug(
             f"[Serial Training] Step {self.global_steps}: train_actor={train_actor}, train_draft={train_draft}"
@@ -2166,6 +2157,9 @@ class PPOTrainer(ABC):
         if self._is_serial_training_enabled():
             metrics.update({
                 "training/global_steps": self.global_steps,
+                # v3 语义：actor_steps 每步递增（每步都是 Actor 步），
+                # draft_steps 每 k 步递增。分母 draft_training_steps = actor // k
+                # 仍然对得上，只是它现在表示「draft 训练次数」而非「Draft 步数」。
                 "training/actor_steps": self.actor_steps,
                 "training/draft_steps": self.draft_steps,
                 "training/actor_progress": self.actor_steps / self.actor_training_steps if self.actor_training_steps > 0 else 0,
