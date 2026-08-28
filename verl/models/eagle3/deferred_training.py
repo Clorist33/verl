@@ -102,13 +102,22 @@ def _chunks(seq, size):
 def refresh_frozen_teacher_head(engine, global_step: Optional[int] = None):
     """Re-snapshot the policy ``lm_head`` onto ``engine._eagle3.frozen_lm_head``.
 
-    Must run **after** ``update_actor`` and **before** draft training, so the
-    snapshot reflects the weights that will be used as the teacher this step.
+    Must run **before** ``update_actor``, not after.
 
-    Reading the head one step late is not a loud failure -- the draft simply
-    learns toward a distribution the policy no longer has, and the only symptom
-    is an acceptance rate that will not climb. Hence a fresh snapshot each step
-    rather than a cached one; the cost is a parameter read, never a forward.
+    The hidden states being trained on were captured during ``compute_log_prob``,
+    which runs before any of this step's mini-batch updates. The teacher is
+    rebuilt as ``lm_head @ stashed_hidden``, so the head has to come from the same
+    weights as the body. Snapshotting after ``update_actor`` composes a
+    post-update head with a pre-update hidden -- a pairing that never existed as a
+    model, so the distribution the draft is distilled toward is not any policy's.
+
+    Nothing raises when this is ordered wrongly. The draft trains against a
+    slightly wrong target and the only symptom is an acceptance rate that will not
+    climb. verl-SpeCo pins the same ordering at ``speco_ray_trainer.py:1891``
+    (sync) ahead of ``:1895`` (update).
+
+    A fresh snapshot every step rather than a cached one, because the head does
+    move between steps; the cost is a parameter read, never a forward.
     """
     from verl.models.eagle3.engine_support import _unwrap_gpt
     from verl.models.eagle3.frozen_teacher import build_frozen_teacher_head
@@ -214,6 +223,13 @@ def train_draft_from_store(
             head.source_step,
             global_step,
         )
+    # NOTE: the check above compares step numbers, so it cannot see an
+    # ordering mistake *within* a step -- taking the snapshot after
+    # update_actor carries the right step number while holding the wrong
+    # weights. That was a real bug here (fixed by moving the snapshot ahead
+    # of update_actor); it is caught by placement, not by this warning.
+    # Detecting it at runtime would mean hashing the head at collection time
+    # and comparing, which costs a full-head read on every step.
 
     gpt = _unwrap_gpt(engine.module)
     draft_holder = getattr(gpt, "_eagle3_draft", None)

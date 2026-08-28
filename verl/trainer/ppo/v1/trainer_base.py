@@ -848,6 +848,18 @@ class PPOTrainer(ABC):
                 with marked_timer("update_critic", timing_raw, color="pink"):
                     batch = self._update_critic(batch, metrics=metrics)
 
+            # 11a. draft teacher 快照：必须在 update_actor **之前**。
+            #      本步采到的 hidden 是 compute_log_prob 那次前向产的，用的是本步
+            #      任何一次 mini-batch 更新**之前**的权重。teacher 的算法是
+            #      lm_head @ 已存 hidden，所以 lm_head 必须来自同一批权重。
+            #      放到 update_actor 之后会把「更新后的头」配到「更新前的身体」上，
+            #      这个组合不对应任何真实存在过的模型 —— 而且不报错，只表现为
+            #      接受率不涨。SpeCo 同样把 sync 放在更新之前
+            #      （speco_ray_trainer.py:1891 vs :1895）。
+            if train_draft:
+                with marked_timer("draft_teacher_snapshot", timing_raw, color="purple"):
+                    self.actor_rollout_wg.snapshot_draft_teacher(batch)
+
             # 11. update actor
             if self.config.trainer.critic_warmup <= self.global_steps:
                 with marked_timer("update_actor", timing_raw, color="red"):
@@ -861,8 +873,7 @@ class PPOTrainer(ABC):
             # 12. draft 训练：必须在 update_actor **之后**。
             #     此时 policy 的激活与梯度已释放，draft 训练的显存与 policy 峰值错开
             #     （这正是 v1/v2 用「独立步」换来的性质，v3 不必再付那次 rollout）。
-            #     teacher 快照也在这里刷新，取的是更新后的 lm_head —— draft 要对齐的
-            #     是 policy 现在的分布，不是上一步的。
+            #     teacher 快照不在这里取 —— 见 11a，它必须早于 update_actor。
             if train_draft:
                 with marked_timer("update_draft", timing_raw, color="purple"):
                     self._update_draft_deferred(batch, metrics=metrics)

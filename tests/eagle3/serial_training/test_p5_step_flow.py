@@ -153,3 +153,40 @@ def test_collection_is_armed_only_on_draft_steps():
     s = SerialTrainingScheduler(5)
     armed = [s.should_train_draft(g) for g in range(1, 11)]
     assert armed == [False, False, False, False, True, False, False, False, False, True]
+
+
+# --------------------------------------------------- teacher snapshot ordering
+
+
+def test_teacher_snapshot_is_taken_before_update_actor():
+    """Pins the ordering that a real bug got wrong.
+
+    The stashed hidden comes from compute_log_prob, i.e. from the weights before
+    this step's mini-batch updates. The teacher is lm_head @ that hidden, so the
+    head must come from the same weights. Snapshotting after update_actor pairs a
+    post-update head with a pre-update body -- a model that never existed.
+
+    Nothing raises when this is wrong: the draft just learns toward a slightly
+    off target, and the only symptom is an acceptance rate that stays flat. The
+    step number is identical either way, so the runtime staleness warning cannot
+    see it either.
+
+    Reading source order is a brittle way to assert anything, and this file
+    elsewhere criticises the legacy tests for doing it. It is used here because
+    the invariant is genuinely positional -- no value at runtime distinguishes a
+    correct snapshot from one taken 200 lines later -- and because _step_once_serial
+    is undecorated, so getsource returns exactly its body. Anything that needs to
+    inspect a @register-decorated method should not follow this pattern; the
+    decorator makes the returned range unreliable.
+    """
+    import inspect
+
+    from verl.trainer.ppo.v1.trainer_base import PPOTrainer
+
+    src = inspect.getsource(PPOTrainer._step_once_serial)
+    snapshot = src.index("snapshot_draft_teacher")
+    update = src.index("self._update_actor(batch")
+    train = src.index("_update_draft_deferred")
+
+    assert snapshot < update, "snapshot must precede update_actor"
+    assert update < train, "draft must train after update_actor, for the memory split"

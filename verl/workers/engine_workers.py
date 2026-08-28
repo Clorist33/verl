@@ -893,14 +893,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         than on top of it -- the memory property the old alternating-step design
         bought at the cost of a whole extra rollout.
 
-        The teacher snapshot is refreshed here rather than at collection time: it
-        must reflect the lm_head the draft is being pulled toward, which is the
-        post-update one.
+        The teacher snapshot is NOT taken here -- see
+        :meth:`snapshot_draft_teacher`, which must run before update_actor.
         """
-        from verl.models.eagle3.deferred_training import (
-            refresh_frozen_teacher_head,
-            train_draft_from_store,
-        )
+        from verl.models.eagle3.deferred_training import train_draft_from_store
 
         engine = self.actor.engine
         state = getattr(engine, "_eagle3", None)
@@ -911,7 +907,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         micro_bsz = getattr(self.actor_config, "draft_ppo_micro_batch_size_per_gpu", None)
 
         with self.engine.train_mode(disable_auto_offload=True), Timer(name="draft_deferred", logger=None) as timer:
-            refresh_frozen_teacher_head(engine, global_step=global_step)
             draft_loss = train_draft_from_store(
                 engine, state.feature_store, micro_batch_size=micro_bsz, global_step=global_step
             )
@@ -920,6 +915,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             return None
         metrics = {"draft_loss": [draft_loss], "draft_time_s": [timer.last]}
         return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    def snapshot_draft_teacher(self, data: TensorDict) -> None:
+        """Snapshot the policy lm_head **before** update_actor runs.
+
+        Ordering here is load-bearing and the failure is silent.
+
+        The hidden states this step stashed were produced during compute_log_prob,
+        i.e. by the weights as they stood *before* any of this step's mini-batch
+        updates. The teacher is rebuilt as ``lm_head @ stashed_hidden``, so the
+        head has to come from that same set of weights. Snapshotting after
+        update_actor pairs a post-update head with a pre-update body -- a
+        combination that never existed as a model, so the distribution the draft
+        is distilled toward is not any policy's.
+
+        Nothing raises if this is skipped or ordered wrongly. The draft trains
+        against a slightly wrong target and the only symptom is an acceptance
+        rate that does not climb. verl-SpeCo pins the same ordering at
+        speco_ray_trainer.py:1891 (sync) vs :1895 (update).
+        """
+        from verl.models.eagle3.deferred_training import refresh_frozen_teacher_head
+
+        engine = getattr(self.actor, "engine", None)
+        state = getattr(engine, "_eagle3", None)
+        if state is None or not state.enabled:
+            return None
+        global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
+        refresh_frozen_teacher_head(engine, global_step=global_step)
+        return None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
