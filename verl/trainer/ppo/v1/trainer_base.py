@@ -640,8 +640,11 @@ class PPOTrainer(ABC):
         k = self.config.algorithm.eagle3.get('actor_steps_per_draft_step', 5)
 
         # 2. 计算推导参数
+        # v3：draft 不再占用独立的 global step，它搭 actor 步的车。所以
+        # total == actor，draft_training_steps 只是「draft 会被训练多少次」，
+        # 不是「多少个步」。v1/v2 的 total = actor + draft 在这里不再成立。
         draft_training_steps = actor_training_steps // k
-        total_training_steps = actor_training_steps + draft_training_steps
+        total_training_steps = actor_training_steps
 
         # 3. 存储参数
         self.actor_training_steps = actor_training_steps
@@ -807,16 +810,29 @@ class PPOTrainer(ABC):
         # 5. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
 
-        # ========== 分支：Actor 训练步 vs Draft 训练步 ==========
-        if train_actor:
-            # === Actor 训练步：禁用 draft ===
+        # ========== v3：只有一种步，draft 每 k 步搭一次车 ==========
+        # v1/v2 在这里分流成「Actor 步」和「Draft 步」，而 rollout 在 :790 早已跑完，
+        # 于是 Draft 步白白付掉一整次推理（实测占该步 89% 时间）。v3 取消分流：每步都是
+        # 完整的 Actor 步，draft 只是在需要的那些步上多做两件事 —— 在 old_log_prob 那次
+        # 前向里采特征，在 update_actor 之后用采到的特征训练。两件事都不需要额外前向。
+        if True:
             # 注意：extra_info 会被 _compute_old_log_prob 内的 tq.kv_batch_put 整体重建
             # （返回全新 KVBatchMeta，extra_info 为空），所以这里设的标志活不到
             # _update_actor。必须同时存到 self 上，由 _update_actor 重新注入。
+            #
+            # draft 永远不在 policy 前向里训练（train_draft_only 恒 False，
+            # enable_draft_training 恒 False）：v3 的 draft 训练发生在
+            # update_actor 之后的独立入口，靠 eagle3_collect_only 采到的特征驱动。
             self._eagle3_serial_flags = {'enable_draft_training': False, 'train_draft_only': False}
             batch.extra_info.update(self._eagle3_serial_flags)
+            batch.extra_info["eagle3_collect_only"] = train_draft
+            batch.extra_info["global_steps"] = self.global_steps
+            self._eagle3_collect_this_step = train_draft
 
-            logger.debug(f"[Serial Training] Step {self.global_steps}: Actor training step")
+            logger.debug(
+                f"[Serial Training] Step {self.global_steps}: actor step"
+                f"{' + draft (collect & train)' if train_draft else ''}"
+            )
 
             # 6. compute old_log_prob
             with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -851,24 +867,43 @@ class PPOTrainer(ABC):
             logger.debug(f"[Serial Training] Global Step {self.global_steps}: "
                         f"Actor step {self.actor_steps}/{self.actor_training_steps}")
 
-        elif train_draft:
-            # === Draft 训练步：Actor forward（冻结）+ Draft 训练 ===
-            # 同上：标志同时存到 self，防止中途 extra_info 被重建后丢失。
-            self._eagle3_serial_flags = {'enable_draft_training': True, 'train_draft_only': True}
-            batch.extra_info.update(self._eagle3_serial_flags)
-
-            logger.info(f"[Serial Training] Step {self.global_steps}: Draft training step")
-
-            # 调用 Draft 专属训练流程
-            with marked_timer("update_draft", timing_raw, color="purple"):
-                batch = self._update_draft(batch, metrics=metrics)
-
-            # === 增加 Draft 步数 ===
-            self.draft_steps += 1
-            logger.debug(f"[Serial Training] Global Step {self.global_steps}: "
-                        f"Draft step {self.draft_steps}/{self.draft_training_steps}")
+            # 12. draft 训练：必须在 update_actor **之后**。
+            #     此时 policy 的激活与梯度已释放，draft 训练的显存与 policy 峰值错开
+            #     （这正是 v1/v2 用「独立步」换来的性质，v3 不必再付那次 rollout）。
+            #     teacher 快照也在这里刷新，取的是更新后的 lm_head —— draft 要对齐的
+            #     是 policy 现在的分布，不是上一步的。
+            if train_draft:
+                with marked_timer("update_draft", timing_raw, color="purple"):
+                    self._update_draft_deferred(batch, metrics=metrics)
+                self.draft_steps += 1
+                logger.debug(f"[Serial Training] Global Step {self.global_steps}: "
+                            f"Draft step {self.draft_steps}/{self.draft_training_steps}")
 
         return batch
+
+    def _update_draft_deferred(self, batch: KVBatchMeta, metrics: dict) -> None:
+        """v3：用本步采集的特征训练 draft（在 update_actor 之后调用）。
+
+        与 :meth:`_update_draft` 的区别：后者是 v1/v2 的独立 Draft 步入口，会触发一次
+        完整的 policy 前向来产 teacher；本方法不跑任何 policy 前向，teacher 由冻结的
+        lm_head 副本从已采集的 hidden 重建。
+        """
+        output = self.actor_rollout_wg.update_draft_deferred(batch)
+        if output is None:
+            logger.warning(
+                "[Serial Training] Step %s: 本步应训 draft，但 worker 没有返回指标。"
+                "可能是没有样本通过采集计划的长度门（response 长度不足），"
+                "或采集根本没有触发。",
+                self.global_steps,
+            )
+            return
+
+        from verl.utils.metric import reduce_metrics
+
+        # 与 _update_actor:2024-2027 一致：rename 之后必须 reduce_metrics，
+        # 否则值仍是 list，aggregate_logger.py:30 的 isinstance(v, numbers.Number)
+        # 会把它静默丢弃，TensorBoard 的 add_scalar 则会抛异常。
+        metrics.update(reduce_metrics(rename_dict(output["metrics"], "draft/")))
 
     def _update_draft(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Draft 训练步骤（新增方法）：
@@ -2235,12 +2270,20 @@ class SerialTrainingScheduler:
         self.k = k
 
     def should_train_actor(self, global_steps: int) -> bool:
-        """判断当前步是否训练 Actor"""
-        return (global_steps % (self.k + 1)) != 0
+        """v3：每一步都训练 Actor。
+
+        v1/v2 让 Actor 步和 Draft 步交替，于是 Draft 步在 trainer_base.py:790
+        白跑一次 rollout（实测占该步 89% 时间）。v3 取消交替：draft 改为搭车，
+        所以这里恒为 True，保留方法只是为了不破坏既有调用方。
+        """
+        return True
 
     def should_train_draft(self, global_steps: int) -> bool:
-        """判断当前步是否训练 Draft"""
-        return (global_steps % (self.k + 1)) == 0
+        """本步是否要采集特征并训练 draft（每 k 步一次）。
+
+        周期是 k 而不是 v1/v2 的 k+1 —— 少掉的那一步正是被取消的独立 Draft 步。
+        """
+        return self.k > 0 and (global_steps % self.k) == 0
 
 
 def register_trainer(name: str):

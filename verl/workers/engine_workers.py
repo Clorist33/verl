@@ -832,9 +832,94 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        # v3 deferred draft training: this forward is the one PPO already pays
+        # for, so it is where draft features get harvested. Opening the store
+        # before the forward and leaving it filled afterwards is the whole
+        # handoff -- update_draft_deferred drains it later in the same step.
+        self._eagle3_open_collection(data)
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
+
+    def _eagle3_open_collection(self, data: TensorDict) -> bool:
+        """Arm feature collection for the upcoming log-prob forward.
+
+        Returns False (and leaves the flag off) whenever deferred training is not
+        active for this step, so the forward takes the ordinary path.
+        """
+        engine = getattr(self.actor, "engine", None)
+        state = getattr(engine, "_eagle3", None)
+        if state is None or not state.enabled:
+            return False
+        if not tu.get_non_tensor_data(data, "eagle3_collect_only", default=False):
+            return False
+
+        from verl.models.eagle3.feature_store import DraftFeatureStore
+
+        global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
+        if state.feature_store is None:
+            state.feature_store = DraftFeatureStore()
+        # begin_step drops anything a previous step left behind and warns if it
+        # was never drained -- features harvested for nothing.
+        state.feature_store.begin_step(global_step)
+        state.collect_config = self._eagle3_collect_config(global_step)
+        return True
+
+    def _eagle3_collect_config(self, global_step: int) -> dict:
+        """Collect-plan knobs, defaulting to the verl-SpeCo values.
+
+        Mirrors verl_speco/config/speco_base.yaml:58-66. Kept identical on
+        purpose for the first runs so results are comparable against a
+        known-good reference (design doc §5 D1).
+        """
+        cfg = getattr(self.actor_config, "eagle3_collect", None) or {}
+        get = cfg.get if hasattr(cfg, "get") else (lambda k, d: getattr(cfg, k, d))
+        return {
+            "global_step": global_step,
+            "window_train_rows": int(get("window_train_rows", 512)),
+            "window_mode": str(get("window_mode", "front")),
+            "sample_rate": float(get("sample_rate", 1.0)),
+            "max_samples_per_replica": int(get("max_samples_per_replica", 16)),
+            "max_tokens_per_replica": int(get("max_tokens_per_replica", 16384)),
+        }
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="orange", role="draft_deferred")
+    def update_draft_deferred(self, data: TensorDict) -> TensorDict:
+        """Train the draft on features stashed during this step's log-prob forward.
+
+        Call after update_actor has returned. By then the policy's activations and
+        gradients are released, so the draft trains beside the policy peak rather
+        than on top of it -- the memory property the old alternating-step design
+        bought at the cost of a whole extra rollout.
+
+        The teacher snapshot is refreshed here rather than at collection time: it
+        must reflect the lm_head the draft is being pulled toward, which is the
+        post-update one.
+        """
+        from verl.models.eagle3.deferred_training import (
+            refresh_frozen_teacher_head,
+            train_draft_from_store,
+        )
+
+        engine = self.actor.engine
+        state = getattr(engine, "_eagle3", None)
+        if state is None or not state.enabled or state.feature_store is None:
+            return None
+
+        global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
+        micro_bsz = getattr(self.actor_config, "draft_ppo_micro_batch_size_per_gpu", None)
+
+        with self.engine.train_mode(disable_auto_offload=True), Timer(name="draft_deferred", logger=None) as timer:
+            refresh_frozen_teacher_head(engine, global_step=global_step)
+            draft_loss = train_draft_from_store(
+                engine, state.feature_store, micro_batch_size=micro_bsz, global_step=global_step
+            )
+
+        if draft_loss is None or not self.engine.is_mp_src_rank_with_outputs():
+            return None
+        metrics = {"draft_loss": [draft_loss], "draft_time_s": [timer.last]}
+        return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")

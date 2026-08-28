@@ -1176,6 +1176,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
             batch, key="enable_draft_training", default=True
         )
 
+        # === EAGLE3 v3 延后训练：采集模式 ===
+        # 只在 compute_log_prob 那次前向上打开。打开时 _postprocess 走
+        # _eagle3_collect_features_step：采特征、不训 draft，真正的训练由
+        # update_actor 之后的 train_draft_from_store 完成。
+        # store 与采集配置挂在 engine 的 _eagle3 上，这里转挂到模型实例，
+        # 因为 _postprocess 只能从 self 读。
+        _e3 = getattr(self, "_eagle3", None)
+        _collect_only = tu.get_non_tensor_data(batch, key="eagle3_collect_only", default=False)
+        unwrapped_model._eagle3_collect_only = bool(_collect_only and _e3 is not None and _e3.enabled)
+        if unwrapped_model._eagle3_collect_only:
+            unwrapped_model._eagle3_feature_store = getattr(_e3, "feature_store", None)
+            unwrapped_model._eagle3_collect_config = getattr(_e3, "collect_config", None) or {}
+
         if hasattr(unwrapped_model, "vp_stage"):
             vp_rank = unwrapped_model.vp_stage
         else:

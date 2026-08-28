@@ -65,7 +65,8 @@ def _validate_eagle3_serial_training_config(config: DictConfig) -> None:
 
     # 3. 计算推导参数
     draft_training_steps = actor_training_steps // k
-    total_training_steps = actor_training_steps + draft_training_steps
+    # v3：draft 搭 actor 步的车，不占独立 global step，所以总步数就是 actor 步数。
+    total_training_steps = actor_training_steps
 
     # 4. 验证：total_training_steps 必须是 (k+1) 的整数倍（周期对齐）
     period = k + 1

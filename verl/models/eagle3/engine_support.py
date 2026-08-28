@@ -383,6 +383,14 @@ class Eagle3TrainingState:
         # logits from stashed hidden states, refreshed once per draft-training step
         # by refresh_frozen_teacher_head(). None whenever deferred training is off.
         self.frozen_lm_head = None
+        # Host-side stash filled during the log-prob forward and drained after
+        # update_actor. Lives on the state rather than the model because the
+        # producer (_postprocess) and the consumer (the worker) reach it from
+        # opposite ends; the engine is the one object both can see.
+        self.feature_store = None
+        # Collect-plan knobs + the current global_step, forwarded to the
+        # _postprocess branch which has no access to config or trainer state.
+        self.collect_config = None
 
 
 def _inject_and_freeze_draft_embed(draft_raw, gpt) -> bool:
