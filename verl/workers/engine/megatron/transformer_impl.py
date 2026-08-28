@@ -876,9 +876,20 @@ class MegatronEngine(BaseEngine):
         )
 
         # EAGLE3: backward the stashed L_draft + step the independent draft optimizer.
-        # Runs only during real training (not forward_only); draft graph is rooted at
-        # the detached aux hidden, so it is independent of the policy backward above.
-        if not forward_only and getattr(self, "_eagle3", None) is not None and self._eagle3.enabled:
+        # draft graph is rooted at the detached aux hidden, so it is independent of
+        # the policy backward above.
+        #
+        # 【为什么不是单纯的 `not forward_only`】串行 Draft 步必须 forward_only=True：
+        # 它没有 old_log_probs/advantages 跑不了 ppo_loss，只能 loss_function=None，
+        # 而 :1324 有硬断言 `assert forward_only`。若守卫只认 `not forward_only`，
+        # 串行就走不进这里，只能在 forward_backward_batch **外面**手工补一次调用——
+        # 那已经在 :936 postprocess_batch_func 之后，会跳过 append_to_dict 对 metrics
+        # 的 list 包装，裸 float 进 allgather_dict_into_dict 后被 train_mini_batch:326
+        # 的 chain.from_iterable 炸掉（'float' object is not iterable）。详见 优化16。
+        #
+        # 并行恒为 forward_only=False，`not forward_only` 短路为 True，本行对并行零影响。
+        _draft_only = tu.get_non_tensor_data(data, key="train_draft_only", default=False)
+        if (not forward_only or _draft_only) and getattr(self, "_eagle3", None) is not None and self._eagle3.enabled:
             from verl.models.eagle3.engine_support import eagle3_backward_step
 
             draft_loss_val = eagle3_backward_step(self)
@@ -1298,41 +1309,17 @@ class MegatronEngineWithLMHead(MegatronEngine):
             # TODO(baiyan): How to support hybrid context parallel with dp_group,
             # now the dp_group is not used, so just leave it as is, but what if we need to use it?
 
-            # === 检查是否是 draft 训练步（串行模式）===
-            # 注意：V1 架构中 micro-batch 是 TensorDict，没有 extra_info 属性，
-            # 非张量元数据必须通过 tu.get_non_tensor_data 读取（与 engine_workers.py 一致）
-            train_draft_only = tu.get_non_tensor_data(data, "train_draft_only", default=False)
-
-            if train_draft_only:
-                # === 串行模式：Draft 训练步 ===
-                # Draft loss 已经在 eagle3_patch.py 中计算并暂存
-                # 这里从 model 中聚合所有 microbatch 的 draft losses
-                draft_losses = []
-                for module in self.model:
-                    if hasattr(module, "_eagle3_draft_losses"):
-                        draft_losses.extend(module._eagle3_draft_losses)
-                        # 清空暂存，准备下一个 step
-                        module._eagle3_draft_losses.clear()
-
-                if draft_losses:
-                    # 聚合所有 microbatch 的 draft loss
-                    loss = torch.stack(draft_losses).mean()
-                    metrics = {
-                        "draft/loss": loss.item(),
-                        "draft/num_microbatches": len(draft_losses),
-                    }
-                else:
-                    # 没有 draft loss（异常情况）
-                    loss = torch.tensor(0.0, device=device)
-                    metrics = {"draft/loss": 0.0, "draft/num_microbatches": 0}
-
-                scaled_loss = loss * data["num_micro_batch"]
-            else:
-                # === 并行模式 or 串行 Actor 步：使用正常的 loss function ===
-                loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
-                # scale loss by num_micro_batch because megatron will scale loss
-                # by n_micro_batch inside pp schedule
-                scaled_loss = loss * data["num_micro_batch"]
+            # 注意（EAGLE3 串行）：这里**不要**为 train_draft_only 特判去聚合 draft loss。
+            # Draft 的 backward + optimizer.step() 由 forward_backward_batch 末尾的
+            # eagle3_backward_step() 统一完成（见本文件 ~L892），它通过 drain_draft_losses()
+            # 取走并清空 _eagle3_draft_losses。若在这里（每个 micro-batch 的 loss_func 内）
+            # 提前 clear，等 eagle3_backward_step 来 drain 时列表已空 -> 直接 return None
+            # -> draft 永不 backward、永不更新，且静默上报成功。
+            # 详见：开发过程记录/串行训练/优化15。
+            loss, metrics = loss_function(model_output=model_output, data=data, dp_group=self.get_data_parallel_group())
+            # scale loss by num_micro_batch because megatron will scale loss
+            # by n_micro_batch inside pp schedule
+            scaled_loss = loss * data["num_micro_batch"]
         else:
             assert forward_only, "forward_only must be True when loss_function is None"
             loss = torch.tensor(1.0, device=device)

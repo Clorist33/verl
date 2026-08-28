@@ -549,6 +549,13 @@ def _eagle3_draft_training_step(
         logger.warning("[DRAFT-TRAIN-SERIAL] Draft or capture not available, skipping draft training")
         return logits
 
+    if not self.training:
+        # 与并行路径的四重门禁对齐（并行见 _eagle3_parallel_training 的 gate）。
+        # eval/推理前向下算出的 draft loss 没有 grad_fn，一旦被 stash，随后
+        # eagle3_backward_step 调 backward() 会报 "element 0 does not require grad"。
+        logger.warning("[DRAFT-TRAIN-SERIAL] model not in training mode, skipping draft training")
+        return logits
+
     if loss_mask is None:
         # 串行 Draft 步没有 loss_mask 就无法算 loss，本步注定空转。
         # 与并行路径的四重门禁保持一致（并行也要求 loss_mask is not None）。

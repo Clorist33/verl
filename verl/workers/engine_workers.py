@@ -450,17 +450,65 @@ class TrainingWorker(Worker, DistProfilerExtension):
         tu.assign_non_tensor_data(data, "enable_draft_training", True)
 
         # 训练流程
+        #
+        # 【为什么不直接调 engine.train_batch】
+        # engine/base.py 的 train_batch 是 zero_grad -> forward_backward(forward_only=False)
+        # -> optimizer_step() 三件套，对串行 Draft 步有两处不适用：
+        #
+        #   1) optimizer_step() 是 **policy** 的 optimizer，没有任何 train_draft_only 守卫。
+        #      串行 Draft 步的语义是"policy 只做 forward 产 teacher，不更新"，直接调
+        #      train_batch 会把 policy 一起用 GRPO 更新掉，与串行设计相悖。
+        #   2) forward_only=False 会让 megatron 对 loss_function 的返回值做 backward，
+        #      而 loss_fn 是 ppo_loss，它需要 old_log_probs / advantages
+        #      （losses.py: data.select("response_mask", "old_log_probs", "advantages")）。
+        #      串行 Draft 分支只跑了 reward + _balance_batch，从没调过 _compute_old_log_prob
+        #      和 _compute_advantage，这两个字段根本不存在 -> KeyError。
+        #
+        # 所以这里改用 forward_only=True 手工展开：
+        #   - loss_function=None + forward_only=True -> postprocess 走常量 loss 分支，
+        #     ppo_loss 永不被调用，问题 2 消失；
+        #   - megatron 在 forward_only 下只是跳过 backward_step，**不加 no_grad**
+        #     （schedules.py:634-652 已确认），所以 draft 的计算图完好存活；
+        #   - policy 全程不 backward，问题 1 消失，且省掉一整个反向的算力/显存；
+        #   - draft 的 backward + draft_optimizer.step() 由 eagle3_backward_step 负责，
+        #     它在 forward_backward_batch 内部执行（该处守卫已放宽为
+        #     `not forward_only or train_draft_only`，以接纳本路径）。串行与并行共用
+        #     同一个调用点和同一套 metrics 包装，本方法不再手工补调。
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch_draft", logger=None) as timer,
         ):
-            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            maybe_fix_3d_position_ids(data)
+            # draft 的 backward + draft_optimizer.step()，以及 draft_loss 写入 metrics，
+            # 均由 forward_backward_batch 内部的 eagle3_backward_step 完成
+            # （transformer_impl.py:892，该处守卫已放宽以接纳 forward_only=True 的串行 Draft 步）。
+            # 注入点在 :936 postprocess_batch_func 之前，metrics 由 append_to_dict 统一包成
+            # list —— 与并行完全同一条路径，串行不再自持形状责任。
+            #
+            # 【不要在这里手工补调 eagle3_backward_step】那样注入点会落到
+            # postprocess_batch_func 之后，跳过 append_to_dict 的包装，裸 float 进
+            # allgather_dict_into_dict 后会被 train_mini_batch:326 的 chain.from_iterable
+            # 炸掉（'float' object is not iterable）。2026-08-28 已经这么错过一次，详见 优化16。
+            output = self.engine.forward_backward_batch(data, loss_function=None, forward_only=True)
 
         delta_time = timer.last
 
         # 处理输出
         if self.engine.is_mp_src_rank_with_outputs():
             output.pop("model_output", None)
+
+            # 【守卫】串行 Draft 步的唯一目的就是训 draft。eagle3_backward_step() 在
+            # 取不到暂存 loss 时会 return None 并静默跳过 backward/step，本步就会整步
+            # 空转却上报"成功"，安静烧掉一轮训练时间（2026-08-26 就这么浪费过一轮）。
+            # 这里显式检查 draft_loss 是否真的产生，没有就直接失败，不允许静默。
+            if "draft_loss" not in output.get("metrics", {}):
+                raise RuntimeError(
+                    "[DRAFT-TRAIN-SERIAL] Draft 训练步没有产生 draft_loss：本步 draft 未做 "
+                    "backward/optimizer.step()，属于整步空转。请检查 eagle3_patch 的 draft "
+                    "前向是否被跳过（如 loss_mask is None），或 _eagle3_draft_losses 是否被 "
+                    "其他代码提前 drain。"
+                )
+
             final_output = self._postprocess_output(
                 output,
                 global_token_num=global_token_num,

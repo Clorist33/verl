@@ -443,7 +443,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - critic/score/mean, max, min: Statistics about sequence scores
             - critic/rewards/mean, max, min: Statistics about sequence rewards
             - critic/advantages/mean, max, min: Statistics about advantages
-            - critic/returns/mean, max, min: Statistics about returns
+              (omitted when the batch has no ``advantages``/``returns``, e.g. the
+              EAGLE3 serial Draft step, which never runs ``_compute_advantage``)
+            - critic/returns/mean, max, min: Statistics about returns (same condition as above)
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
@@ -453,8 +455,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
-    advantages = batch.batch["advantages"]
-    returns = batch.batch["returns"]
+    # 串行 Draft 步不跑 _compute_advantage（trainer_base.py:854-869 只做 reward +
+    # _balance_batch），batch 里没有 advantages/returns。缺字段就跳过依赖它们的那几项，
+    # 而不是让整个指标统计崩掉 —— 与本文件 compute_variance_proxy_metrics 的
+    # 「缺字段即 return {}」既有惯例一致。
+    has_adv = "advantages" in batch.batch and "returns" in batch.batch
 
     max_prompt_length = batch.batch["prompts"].shape[-1]
     max_response_length = batch.batch["responses"].shape[-1]
@@ -487,23 +492,35 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         logger.warning("All samples are aborted, returning default reward metrics")
         reward_mean = reward_max = reward_min = float("nan")
 
-    valid_adv = torch.masked_select(advantages, response_mask)
-    valid_returns = torch.masked_select(returns, response_mask)
+    if has_adv:
+        advantages = batch.batch["advantages"]
+        returns = batch.batch["returns"]
 
-    if valid_adv.numel() > 0:
-        adv_mean = torch.mean(valid_adv).detach().item()
-        adv_max = torch.max(valid_adv).detach().item()
-        adv_min = torch.min(valid_adv).detach().item()
+        valid_adv = torch.masked_select(advantages, response_mask)
+        valid_returns = torch.masked_select(returns, response_mask)
+
+        if valid_adv.numel() > 0:
+            adv_mean = torch.mean(valid_adv).detach().item()
+            adv_max = torch.max(valid_adv).detach().item()
+            adv_min = torch.min(valid_adv).detach().item()
+        else:
+            logger.warning("Response mask is all False, returning default advantage metrics")
+            adv_mean = adv_max = adv_min = float("nan")
+
+        if valid_returns.numel() > 0:
+            returns_mean = torch.mean(valid_returns).detach().item()
+            returns_max = torch.max(valid_returns).detach().item()
+            returns_min = torch.min(valid_returns).detach().item()
+        else:
+            logger.warning("Response mask is all False, returning default return metrics")
+            returns_mean = returns_max = returns_min = float("nan")
     else:
-        logger.warning("Response mask is all False, returning default advantage metrics")
+        # 串行 Draft 步：advantages/returns 本就不适用（不是"算出来是空"），
+        # 所以这里**不复用**上面那两条 "Response mask is all False" 警告，避免误导排查。
+        # 下方 metrics 字典也不会发出对应的 6 个键。
+        # valid_returns 仍需定义：use_critic 分支要读它的 .numel()。
+        valid_returns = torch.empty(0, device=response_mask.device)
         adv_mean = adv_max = adv_min = float("nan")
-
-    if valid_returns.numel() > 0:
-        returns_mean = torch.mean(valid_returns).detach().item()
-        returns_max = torch.max(valid_returns).detach().item()
-        returns_min = torch.min(valid_returns).detach().item()
-    else:
-        logger.warning("Response mask is all False, returning default return metrics")
         returns_mean = returns_max = returns_min = float("nan")
 
     # Aborted samples and non-aborted response length statistics
@@ -560,14 +577,20 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
-        # adv
-        "critic/advantages/mean": adv_mean,
-        "critic/advantages/max": adv_max,
-        "critic/advantages/min": adv_min,
-        # returns
-        "critic/returns/mean": returns_mean,
-        "critic/returns/max": returns_max,
-        "critic/returns/min": returns_min,
+        # adv / returns —— 串行 Draft 步没有这两个字段，本步直接不发出这 6 个键
+        # （指标序列表现为断点，语义是"本步不适用"，比发 NaN 更准确）。
+        **(
+            {
+                "critic/advantages/mean": adv_mean,
+                "critic/advantages/max": adv_max,
+                "critic/advantages/min": adv_min,
+                "critic/returns/mean": returns_mean,
+                "critic/returns/max": returns_max,
+                "critic/returns/min": returns_min,
+            }
+            if has_adv
+            else {}
+        ),
         **critic_value_metrics,
         # response length
         "response_length/mean": torch.mean(response_length).detach().item(),

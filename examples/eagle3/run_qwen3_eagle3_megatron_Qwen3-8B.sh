@@ -164,7 +164,7 @@ USE_MEGATRON_DRAFT=${USE_MEGATRON_DRAFT:-True}
 #                 -> at TRAIN_TP=4 the draft shards 4 ways (full ~2.2GB/card saving).
 #   <n>         = force draft TP = n (must divide BOTH policy TP and num_query_groups);
 #                 n < policy_tp builds a dedicated draft TP sub-group (PP=1/CP=1 only).
-DRAFT_TP=${DRAFT_TP:-4}  #2
+DRAFT_TP=${DRAFT_TP:-1}  #2 
 DRAFT_LR=${DRAFT_LR:-1e-6}
 LOSS_WEIGHT=${LOSS_WEIGHT:-1.0}
 NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
