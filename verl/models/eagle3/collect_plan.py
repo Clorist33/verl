@@ -82,6 +82,46 @@ class CollectPlan:
     window_mode: str
 
 
+@dataclass
+class CollectBudget:
+    """Step-level remaining quota, shared across micro-batches.
+
+    The quotas in :func:`build_collect_plan` bound one call, and verl-SpeCo calls
+    it once per step from the driver, where the whole batch is visible. We call it
+    from ``_postprocess``, which Megatron invokes **per micro-batch** -- and at
+    ``ppo_micro_batch_size_per_gpu=1`` that is one sequence per call. A per-call
+    quota of 16 can never bind on a batch of 1, so every micro-batch collected its
+    sample and the step ended up with one window per sequence (64 per rank at the
+    current sizing) instead of the 16 the design budgets for.
+
+    This carries what is left of the step's quota between those calls. Reset once
+    per ``compute_log_prob`` in ``_eagle3_open_collection``, decremented after each
+    micro-batch actually stashes.
+    """
+
+    max_samples: Optional[int] = DEFAULT_MAX_SAMPLES_PER_REPLICA
+    max_tokens: Optional[int] = DEFAULT_MAX_TOKENS_PER_REPLICA
+    used_samples: int = 0
+    used_tokens: int = 0
+
+    def remaining_samples(self) -> Optional[int]:
+        return None if self.max_samples is None else max(self.max_samples - self.used_samples, 0)
+
+    def remaining_tokens(self) -> Optional[int]:
+        return None if self.max_tokens is None else max(self.max_tokens - self.used_tokens, 0)
+
+    def exhausted(self) -> bool:
+        return self.remaining_samples() == 0 or self.remaining_tokens() == 0
+
+    def consume(self, n_samples: int, n_tokens: int) -> None:
+        self.used_samples += int(n_samples)
+        self.used_tokens += int(n_tokens)
+
+    def reset(self) -> None:
+        self.used_samples = 0
+        self.used_tokens = 0
+
+
 def _hash_fraction(key: str) -> float:
     """Deterministic [0, 1) draw. Port of speco_ray_trainer.py:927-929."""
     digest = hashlib.blake2b(key.encode(), digest_size=8).digest()

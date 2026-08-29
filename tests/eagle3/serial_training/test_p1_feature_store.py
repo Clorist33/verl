@@ -197,7 +197,14 @@ def test_none_plan_collects_nothing():
     ) == 0
 
 
-def test_missing_optional_inputs_get_defaults():
+def test_absent_position_ids_fall_back_to_absolute_positions():
+    """verl passes position_ids=None outside MTP training (model_forward.py:366).
+
+    Zeros would pin every window to position 0, so the draft's RoPE offset would
+    be wrong for any window that does not start at the sequence head. Fall back to
+    the window's own positions + 1, which is what verl-SpeCo stores
+    (eagle3_trainer_backend.py:820-822).
+    """
     plan = _plan_for([3], [30], rows=6)
     store = DraftFeatureStore()
     store.begin_step(1)
@@ -207,7 +214,8 @@ def test_missing_optional_inputs_get_defaults():
         plan=plan, global_step=1,
     )
     rec = store.drain()[0]
-    assert torch.equal(rec.position_ids, torch.zeros(7, dtype=torch.long))
+    assert torch.equal(rec.position_ids, rec.positions + 1)
+    assert rec.position_ids[0].item() == 3, "window opens at prompt_len-1=2, so id is 3"
     assert rec.loss_mask.all()
 
 

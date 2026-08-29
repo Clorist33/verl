@@ -484,6 +484,17 @@ def _eagle3_collect_features_step(
         from verl.models.eagle3.feature_store import collect_draft_features
 
         cfg = getattr(self, "_eagle3_collect_config", None) or {}
+        # Quota is per STEP, not per micro-batch. _postprocess runs once per
+        # micro-batch, so passing the configured quota straight through would
+        # restart it on every call -- and at micro_batch_size_per_gpu=1 a quota
+        # of 16 never binds on a batch of 1, so the step ends up collecting one
+        # window per sequence. The budget object carries what is left.
+        budget = getattr(self, "_eagle3_collect_budget", None)
+        if budget is not None and budget.exhausted():
+            return logits
+        max_samples = budget.remaining_samples() if budget is not None else cfg.get("max_samples_per_replica", 16)
+        max_tokens = budget.remaining_tokens() if budget is not None else cfg.get("max_tokens_per_replica", 16384)
+
         prompt_lens, response_lens = lens_from_loss_mask(loss_mask)
         plan = build_collect_plan(
             prompt_lens=prompt_lens,
@@ -492,8 +503,8 @@ def _eagle3_collect_features_step(
             window_train_rows=cfg.get("window_train_rows", 512),
             window_mode=cfg.get("window_mode", "front"),
             sample_rate=cfg.get("sample_rate", 1.0),
-            max_samples_per_replica=cfg.get("max_samples_per_replica", 16),
-            max_tokens_per_replica=cfg.get("max_tokens_per_replica", 16384),
+            max_samples_per_replica=max_samples,
+            max_tokens_per_replica=max_tokens,
         )
         if plan is None:
             return logits
@@ -514,9 +525,14 @@ def _eagle3_collect_features_step(
             sequence_parallel=getattr(self.config, "sequence_parallel", False),
             tp_world_size=_eagle3_tp_world_size(),
         )
+        if budget is not None and stored:
+            budget.consume(stored, stored * plan.hidden_rows)
         logger.warning(
-            "[DRAFT-COLLECT] step %s: stashed %d/%d window(s) (%d candidates)",
+            "[DRAFT-COLLECT] step %s: stashed %d/%d window(s) (%d candidates); "
+            "step budget left: %s samples / %s rows",
             cfg.get("global_step", 0), stored, plan.selected_count, plan.candidate_count,
+            budget.remaining_samples() if budget is not None else "n/a",
+            budget.remaining_tokens() if budget is not None else "n/a",
         )
     except Exception as e:
         logger.error(

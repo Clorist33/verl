@@ -275,10 +275,16 @@ def collect_draft_features(
             aux_hidden=aux_hidden[batch_idx].index_select(0, idx).detach().to("cpu"),
             final_hidden=final_hidden[batch_idx].index_select(0, idx).detach().to("cpu"),
             input_ids=ids_row.index_select(0, idx.to(ids_row.device)).detach().to("cpu"),
+            # verl's THD forward passes position_ids=None outside MTP training
+            # (model_forward.py:366), so pos_row is normally absent. Fall back to
+            # the window's own absolute positions + 1 rather than zeros: that is
+            # what verl-SpeCo stores (eagle3_trainer_backend.py:820-822), and the
+            # draft uses it to offset RoPE so the window carries the phase range it
+            # will meet at inference. Zeros would pin every window to position 0.
             position_ids=(
                 pos_row.index_select(0, idx.to(pos_row.device)).detach().to("cpu")
                 if pos_row is not None
-                else torch.zeros(idx.numel(), dtype=torch.long)
+                else (positions.detach().to("cpu") + 1)
             ),
             loss_mask=(
                 mask_row.index_select(0, idx.to(mask_row.device)).detach().to("cpu")

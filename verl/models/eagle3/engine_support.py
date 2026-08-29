@@ -41,7 +41,7 @@ def _unwrap_gpt(model_list):
     return _resolve_gpt_model(model_list[0])
 
 
-def build_draft_hf_config(policy_hf_config, eagle3_cfg):
+def build_draft_hf_config(policy_hf_config, eagle3_cfg, pad_token_id=None):
     """Build the draft's HF config from the draft ckpt, recording the policy
     hidden size as ``target_hidden_size`` (the aux hidden dim the draft fuses)."""
     from transformers import AutoConfig
@@ -58,11 +58,40 @@ def build_draft_hf_config(policy_hf_config, eagle3_cfg):
 
     if eagle3_cfg.enable_vocab_compression and eagle3_cfg.draft_vocab_size > 0:
         draft_config.draft_vocab_size = eagle3_cfg.draft_vocab_size
+
+    # pad id, supplied by the caller when the draft ckpt does not carry one.
+    #
+    # The draft masks its loss positions with ``input_ids != pad_token_id``
+    # (draft_megatron.py) and falls back to 0 when the attribute is missing.
+    # verl-SpeCo resolves it identically -- config if present, else 0
+    # (base_trainer.py:397-405, eagle3_trainer_backend.py:749) -- so the mechanism
+    # matches; what differs is that a SpeCo deployment sets the id in its model
+    # config, while Qwen3's converted draft ckpt has none.
+    #
+    # Left at 0 the mask drops every position holding token id 0, which is '!' in
+    # Qwen3, while the real pad token trains as if it were content. Both are
+    # silent. Note the id must come from the *tokenizer* (151643,
+    # <|endoftext|>): the policy's HF config has no pad_token_id either, and its
+    # eos (151645, <|im_end|>) is ordinary content that must stay in the loss.
+    if getattr(draft_config, "pad_token_id", None) is None:
+        if pad_token_id is not None:
+            draft_config.pad_token_id = int(pad_token_id)
+            logger.warning(
+                "eagle3: draft ckpt carries no pad_token_id; using %d from the "
+                "tokenizer. At the default of 0 the draft would drop every '!' "
+                "position from its loss.",
+                draft_config.pad_token_id,
+            )
+        else:
+            logger.warning(
+                "eagle3: no pad_token_id on the draft ckpt and none supplied; the "
+                "draft falls back to 0, masking token id 0 out of its loss."
+            )
     return draft_config
 
 
 def build_draft_module(policy_hf_config, eagle3_cfg, device, dtype=torch.bfloat16,
-                       num_aux_hidden_states=None):
+                       num_aux_hidden_states=None, pad_token_id=None):
     """Construct the self-written draft, load ckpt weights + vocab mapping.
 
     Two backends, selected by ``eagle3_cfg.use_megatron_draft``:
@@ -74,13 +103,13 @@ def build_draft_module(policy_hf_config, eagle3_cfg, device, dtype=torch.bfloat1
     Returns the draft module on ``device`` (NOT yet DDP-wrapped)."""
     if getattr(eagle3_cfg, "use_megatron_draft", False):
         return _build_megatron_draft(
-            policy_hf_config, eagle3_cfg, device, dtype=dtype,
+            policy_hf_config, eagle3_cfg, device, dtype=dtype, pad_token_id=pad_token_id,
             num_aux_hidden_states=num_aux_hidden_states,
         )
 
     from verl.models.eagle3.draft_mcore import LlamaForCausalLMEagle3
 
-    draft_config = build_draft_hf_config(policy_hf_config, eagle3_cfg)
+    draft_config = build_draft_hf_config(policy_hf_config, eagle3_cfg, pad_token_id=pad_token_id)
     draft = LlamaForCausalLMEagle3(draft_config, attention_backend="sdpa")
 
     # load draft ckpt weights if present (best-effort; missing keys tolerated)
@@ -251,7 +280,7 @@ def _build_draft_transformer_config(draft_hf_config, policy_hf_config, param_dty
 
 
 def _build_megatron_draft(policy_hf_config, eagle3_cfg, device, dtype=torch.bfloat16,
-                          num_aux_hidden_states=None):
+                          num_aux_hidden_states=None, pad_token_id=None):
     """Construct the MegatronModule draft (TP-sharded backbone).
 
     NOTE (Step 4): this builds + places the module. HF->Megatron weight mapping is
@@ -265,7 +294,7 @@ def _build_megatron_draft(policy_hf_config, eagle3_cfg, device, dtype=torch.bflo
 
     # ===============================================
     # 第一步:建 draft 的 HF config
-    draft_hf_config = build_draft_hf_config(policy_hf_config, eagle3_cfg)
+    draft_hf_config = build_draft_hf_config(policy_hf_config, eagle3_cfg, pad_token_id=pad_token_id)
 
     # ===============================================
     # 第二步:提取关键尺寸
@@ -391,6 +420,10 @@ class Eagle3TrainingState:
         # Collect-plan knobs + the current global_step, forwarded to the
         # _postprocess branch which has no access to config or trainer state.
         self.collect_config = None
+        # Step-level remaining quota. _postprocess runs per micro-batch, so a
+        # per-call quota would never bind at micro_batch_size_per_gpu=1; this
+        # carries the step's budget across those calls.
+        self.collect_budget = None
 
 
 def _inject_and_freeze_draft_embed(draft_raw, gpt) -> bool:
@@ -578,6 +611,7 @@ def setup_eagle3_training(engine, policy_module_list) -> Optional[Eagle3Training
     draft_raw = build_draft_module(
         engine.model_config.hf_config, eagle3_cfg, device, dtype=param_dtype,
         num_aux_hidden_states=len(layer_ids),
+        pad_token_id=getattr(getattr(engine.model_config, "tokenizer", None), "pad_token_id", None),
     )
 
     # =================================================

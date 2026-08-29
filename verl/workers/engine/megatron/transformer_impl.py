@@ -1188,6 +1188,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         if unwrapped_model._eagle3_collect_only:
             unwrapped_model._eagle3_feature_store = getattr(_e3, "feature_store", None)
             unwrapped_model._eagle3_collect_config = getattr(_e3, "collect_config", None) or {}
+            unwrapped_model._eagle3_collect_budget = getattr(_e3, "collect_budget", None)
 
         if hasattr(unwrapped_model, "vp_stage"):
             vp_rank = unwrapped_model.vp_stage

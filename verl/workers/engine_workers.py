@@ -862,7 +862,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # begin_step drops anything a previous step left behind and warns if it
         # was never drained -- features harvested for nothing.
         state.feature_store.begin_step(global_step)
-        state.collect_config = self._eagle3_collect_config(global_step)
+        cfg = self._eagle3_collect_config(global_step)
+        state.collect_config = cfg
+
+        # Reset the step's quota here, NOT in _postprocess: that runs once per
+        # micro-batch, and at micro_batch_size_per_gpu=1 each call sees a single
+        # sequence, so a per-call quota of 16 can never bind. Resetting per
+        # micro-batch is what let a step collect one window per sequence
+        # (64 per rank) instead of the 16 budgeted.
+        from verl.models.eagle3.collect_plan import CollectBudget
+
+        state.collect_budget = CollectBudget(
+            max_samples=cfg["max_samples_per_replica"],
+            max_tokens=cfg["max_tokens_per_replica"],
+        )
         return True
 
     def _eagle3_collect_config(self, global_step: int) -> dict:

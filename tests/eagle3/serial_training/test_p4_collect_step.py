@@ -223,3 +223,81 @@ def test_non_final_pipeline_stage_passes_hidden_through():
     )
     assert out is hidden
     assert model.output_calls == 0
+
+
+# --------------------------------------------------- step-level quota
+
+from verl.models.eagle3.collect_plan import CollectBudget  # noqa: E402
+
+
+def _model_with_budget(store, budget, rows=4):
+    cap = _FakeCapture(torch.randn(S, B, H * NUM_AUX))
+    m = _Model(store, cap, cfg={"global_step": 1, "window_train_rows": rows})
+    m._eagle3_collect_budget = budget
+    return m, cap
+
+
+def test_quota_spans_micro_batches():
+    """_postprocess runs per micro-batch; the quota must not restart each time.
+
+    At micro_batch_size_per_gpu=1 a per-call quota of 16 can never bind on a
+    batch of 1, so every micro-batch collected its sample and a step ended up
+    with one window per sequence instead of the budgeted 16.
+    """
+    store = _store()
+    budget = CollectBudget(max_samples=3, max_tokens=None)
+    mask = torch.stack([_mask(3, 15, S), _mask(3, 15, S)])  # B=2 per call
+
+    for _ in range(5):  # five micro-batches, two candidates each
+        model, _ = _model_with_budget(store, budget)
+        _run(model, mask)
+
+    assert len(store) == 3, "quota must cap the whole step, not each micro-batch"
+    assert budget.remaining_samples() == 0
+
+
+def test_token_quota_also_spans_micro_batches():
+    store = _store()
+    rows = 4
+    budget = CollectBudget(max_samples=None, max_tokens=2 * (rows + 1))
+    mask = torch.stack([_mask(3, 15, S), _mask(3, 15, S)])
+
+    for _ in range(4):
+        model, _ = _model_with_budget(store, budget, rows=rows)
+        _run(model, mask)
+
+    assert len(store) == 2
+    assert budget.remaining_tokens() == 0
+
+
+def test_exhausted_budget_short_circuits_before_planning():
+    """Once spent, later micro-batches must not even build a plan."""
+    store = _store()
+    budget = CollectBudget(max_samples=0, max_tokens=0)
+    model, cap = _model_with_budget(store, budget)
+    logits = _run(model, torch.stack([_mask(3, 15, S), _mask(3, 15, S)]))
+
+    assert logits.shape == (B, S, 5), "policy path still unaffected"
+    assert len(store) == 0
+    assert cap.cleared == 1, "capture still released"
+
+
+def test_budget_only_charges_what_was_actually_stored():
+    store = _store()
+    budget = CollectBudget(max_samples=10, max_tokens=None)
+    # sample 1's response is too short -> only one window stored
+    model, _ = _model_with_budget(store, budget)
+    _run(model, torch.stack([_mask(3, 15, S), _mask(3, 2, S)]))
+
+    assert len(store) == 1
+    assert budget.used_samples == 1
+
+
+def test_absent_budget_falls_back_to_the_config_quota():
+    """Keeps the branch usable without a budget (e.g. a one-shot call)."""
+    store = _store()
+    cap = _FakeCapture(torch.randn(S, B, H * NUM_AUX))
+    model = _Model(store, cap, cfg={"global_step": 1, "window_train_rows": 4,
+                                    "max_samples_per_replica": 1})
+    _run(model, torch.stack([_mask(3, 15, S), _mask(3, 15, S)]))
+    assert len(store) == 1

@@ -347,7 +347,22 @@ class MegatronEagle3DraftModel(MegatronModule):
         # reference applies fc at the top level, then EagleModule injects embeddings).
         hidden_sbf = self.eagle_module.fc(hidden_sbf)
 
-        rotary_pos_emb = self.eagle_module.rotary_pos_emb(seq_len)
+        # RoPE positions. verl's THD forward passes position_ids=None unless MTP
+        # training is on (model_forward.py:366), so the in-forward path lands on
+        # offset=0 and behaves exactly as before. Deferred training harvests a
+        # *window* out of the middle of a sequence and supplies its absolute
+        # positions, so RoPE has to start where the window does -- verl-SpeCo does
+        # the same, feeding hidden_positions + 1 and indexing its RoPE table by
+        # them (eagle3_trainer_backend.py:820-822, llama_eagle.py:164).
+        #
+        # Attention scores only depend on relative offsets, so a shifted window is
+        # self-consistent either way. What the offset buys is matching the phase
+        # range the drafter meets at inference, where positions are absolute.
+        rope_offset = 0
+        if position_ids is not None and position_ids.numel() > 0:
+            flat = position_ids.reshape(-1) if position_ids.dim() > 1 else position_ids
+            rope_offset = int(flat[0].item())
+        rotary_pos_emb = self.eagle_module.rotary_pos_emb(seq_len, offset=rope_offset)
         final_hidden, _ = self.eagle_module(
             embeddings=inputs_embeds,
             hidden_states=hidden_sbf,
