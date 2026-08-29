@@ -450,6 +450,12 @@ def lens_from_loss_mask(loss_mask: torch.Tensor):
 
     Samples with an all-False row get ``(0, 0)`` and are dropped by the plan's
     length gate rather than producing a bogus window.
+
+    P2#5 洞守卫（SpeCo 同款处理）：loss_mask 在 response 中间有 False（多轮/tool 数据）
+    时，response_len 等于 True 总数，可能小于实际 span；这与 SpeCo 同款（它也是取
+    continuous window，不跳洞）——差异只在 prompt_len/response_len 的计算精度。
+    检测到非连续 mask（既有 True 又有 False 夹在其中）时打 WARNING，便于多轮数据
+    切换后发现问题，但不拦截（当前单轮数学数据无影响）。
     """
     if loss_mask.dim() == 1:
         loss_mask = loss_mask.unsqueeze(0)
@@ -461,6 +467,28 @@ def lens_from_loss_mask(loss_mask: torch.Tensor):
     first_true = mask.to(torch.uint8).argmax(dim=1).to(torch.long)
     prompt_lens = torch.where(has_any, first_true, torch.zeros_like(first_true))
     response_lens = torch.where(has_any, response_lens, torch.zeros_like(response_lens))
+
+    # P2#5: detect non-contiguous mask (holes inside response) and warn.
+    # A contiguous response has no False between the first True and the last True.
+    # Check: count Trues between first and last True; if < (last - first + 1) there are holes.
+    for b in range(mask.shape[0]):
+        if not bool(has_any[b]):
+            continue
+        row = mask[b]
+        last_true = int(row.flip(0).to(torch.uint8).argmax().item())
+        last_true = int(mask.shape[1]) - 1 - last_true
+        span = last_true - int(first_true[b].item()) + 1
+        trues = int(response_lens[b].item())
+        if trues < span:
+            logger.warning(
+                "[DRAFT-COLLECT] sample %d: non-contiguous loss_mask detected "
+                "(span=%d, True count=%d, holes=%d). "
+                "Window semantics may be off for multi-turn / tool data "
+                "(SpeCo handles this the same way -- windows are contiguous).",
+                b, span, trues, span - trues,
+            )
+            break  # warn once per postprocess call, not per sample
+
     return prompt_lens.cpu(), response_lens.cpu()
 
 

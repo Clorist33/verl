@@ -881,19 +881,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def _eagle3_collect_config(self, global_step: int) -> dict:
         """Collect-plan knobs, defaulting to the verl-SpeCo values.
 
-        Mirrors verl_speco/config/speco_base.yaml:58-66. Kept identical on
-        purpose for the first runs so results are comparable against a
-        known-good reference (design doc §5 D1).
+        Mirrors verl_speco/config/speco_base.yaml:58-66 and exposes them via
+        ActorConfig.draft_collect_* fields so callers can override via hydra
+        without touching code (P2#4 panel).
         """
-        cfg = getattr(self.actor_config, "eagle3_collect", None) or {}
-        get = cfg.get if hasattr(cfg, "get") else (lambda k, d: getattr(cfg, k, d))
+        cfg = self.actor_config
+        _g = lambda attr, default: (  # noqa: E731
+            v if (v := getattr(cfg, attr, None)) is not None else default
+        )
         return {
             "global_step": global_step,
-            "window_train_rows": int(get("window_train_rows", 512)),
-            "window_mode": str(get("window_mode", "front")),
-            "sample_rate": float(get("sample_rate", 1.0)),
-            "max_samples_per_replica": int(get("max_samples_per_replica", 16)),
-            "max_tokens_per_replica": int(get("max_tokens_per_replica", 16384)),
+            "window_train_rows": int(_g("draft_collect_window_train_rows", 512)),
+            "window_mode": str(_g("draft_collect_window_mode", "front")),
+            "sample_rate": float(_g("draft_collect_sample_rate", 1.0)),
+            "max_samples_per_replica": int(_g("draft_collect_max_samples_per_replica", 16)),
+            "max_tokens_per_replica": int(_g("draft_collect_max_tokens_per_replica", 16384)),
         }
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -918,11 +920,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
         micro_bsz = getattr(self.actor_config, "draft_ppo_micro_batch_size_per_gpu", None)
-        # SpeCo 式内循环参数（P1-2）：一次触发做 steps 次独立更新，每次从本步窗口池
-        # 随机采 batch 个窗口（对标 speco_base.yaml 的 training.step / batch_size_per_gpu）。
         steps_per_trigger = int(getattr(self.actor_config, "draft_steps_per_trigger", None) or 10)
         train_bsz = getattr(self.actor_config, "draft_train_batch_size_per_gpu", None)
         train_bsz = int(train_bsz) if train_bsz else 4
+
+        # 把 global_step 挂到 engine 上，供 eagle3_backward_step 记录 last_trained_global_step
+        # (#2 权重只在训过的步同步，镜像 SpeCo speco_worker.py:921 的 last_trained_step）
+        engine._eagle3_last_global_step = global_step
 
         with self.engine.train_mode(disable_auto_offload=True), Timer(name="draft_deferred", logger=None) as timer:
             result = train_draft_from_store(

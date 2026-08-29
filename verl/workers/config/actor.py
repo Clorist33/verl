@@ -167,6 +167,25 @@ class ActorConfig(BaseConfig):
     draft_steps_per_trigger: int = 10
     draft_train_batch_size_per_gpu: int = 4
 
+    # === Draft LR scheduler（#1，对标 SpeCo lr_scheduler.py）===
+    # draft_lr_scheduler_type: "constant"（默认，可选 "cosine" / "global_cosine"）
+    # draft_lr_warmup_steps: warmup 步数（optimizer step 计）
+    # draft_lr_decay_steps: cosine/global_cosine 衰减步数
+    # draft_lr_min_ratio:   LR 下限 = base_lr × min_ratio
+    draft_lr_scheduler_type: str = "cosine"
+    draft_lr_warmup_steps: int = 200
+    draft_lr_decay_steps: int = 1000
+    draft_lr_min_ratio: float = 0.0
+
+    # === V3 采集计划配置面板（#4，对标 SpeCo speco_base.yaml:58-66）===
+    # 通过 +actor_rollout_ref.actor.draft_collect_window_train_rows=N 等方式在脚本里覆盖。
+    # None = 使用 collect_plan.py 里的代码默认值（与 SpeCo 对齐）。
+    draft_collect_window_train_rows: Optional[int] = None   # 默认 512
+    draft_collect_window_mode: Optional[str] = None         # 默认 "front"
+    draft_collect_sample_rate: Optional[float] = None       # 默认 1.0
+    draft_collect_max_samples_per_replica: Optional[int] = None   # 默认 16
+    draft_collect_max_tokens_per_replica: Optional[int] = None    # 默认 16384
+
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384

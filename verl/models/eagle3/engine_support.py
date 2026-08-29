@@ -405,6 +405,7 @@ class Eagle3TrainingState:
         self.draft_module = None       # DDP-wrapped draft
         self.draft_raw = None          # underlying nn.Module (for patch/save)
         self.draft_optimizer = None
+        self.draft_lr_scheduler = None  # LR scheduler（对标 SpeCo build_drafter_lr_scheduler）
         self.capture = None
         self.enabled = False
         self.optim_offload = False     # keep draft AdamW state on CPU between steps
@@ -424,6 +425,10 @@ class Eagle3TrainingState:
         # per-call quota would never bind at micro_batch_size_per_gpu=1; this
         # carries the step's budget across those calls.
         self.collect_budget = None
+        # Last global_step on which eagle3_backward_step completed an optimizer
+        # step successfully.  Used by get_per_tensor_param to skip the draft
+        # weight export on steps where draft was not trained.
+        self.last_trained_global_step: int = -1
 
 
 def _inject_and_freeze_draft_embed(draft_raw, gpt) -> bool:
@@ -661,6 +666,7 @@ def setup_eagle3_training(engine, policy_module_list) -> Optional[Eagle3Training
     state.draft_module = draft_module
     state.draft_raw = draft_raw
     state.draft_optimizer = draft_optimizer
+    state.draft_lr_scheduler = _build_draft_lr_scheduler(draft_optimizer, eagle3_cfg)
     state.capture = capture
     state.enabled = True
     state.optim_offload = bool(getattr(eagle3_cfg, "draft_optim_offload", False))
@@ -710,6 +716,65 @@ def _build_draft_optimizer(draft_module, eagle3_cfg):
         lr=eagle3_cfg.draft_optim_lr,
         weight_decay=eagle3_cfg.draft_optim_weight_decay,
     )
+
+
+def _build_draft_lr_scheduler(optimizer, eagle3_cfg):
+    """Build a LR scheduler for the draft optimizer.
+
+    Mirrors verl-SpeCo's ``build_drafter_lr_scheduler`` (lr_scheduler.py).
+    Supports three modes via ``draft_lr_scheduler_type``:
+      - ``"constant"`` (default): flat lr, optional linear warmup.
+      - ``"cosine"``: cosine decay with warmup (HF schedule).
+      - ``"global_cosine"``: clamp-floored cosine decay, decay_steps counts
+        optimizer steps globally, min_lr_ratio sets the floor.
+
+    Config keys (all on eagle3_cfg, all optional):
+      draft_lr_scheduler_type   str    "constant"
+      draft_lr_warmup_steps     int    0       (steps of linear warmup)
+      draft_lr_decay_steps      int    100     (only for global_cosine)
+      draft_lr_min_ratio        float  0.0     (floor fraction for cosine)
+    """
+    import math
+    from torch.optim.lr_scheduler import LambdaLR
+
+    stype = str(getattr(eagle3_cfg, "draft_lr_scheduler_type", "constant") or "constant").strip().lower()
+    warmup = int(getattr(eagle3_cfg, "draft_lr_warmup_steps", 0) or 0)
+    decay_steps = int(getattr(eagle3_cfg, "draft_lr_decay_steps", 100) or 100)
+    min_ratio = float(getattr(eagle3_cfg, "draft_lr_min_ratio", 0.0) or 0.0)
+
+    if stype == "constant":
+        if warmup <= 0:
+            return None  # constant + no warmup → no scheduler needed
+        def lr_lambda(step):
+            if step < warmup:
+                return float(step) / float(max(1, warmup))
+            return 1.0
+        return LambdaLR(optimizer, lr_lambda)
+
+    if stype == "cosine":
+        # HF cosine with warmup: decays to min_ratio * base_lr.
+        def lr_lambda(step):
+            if step < warmup:
+                return float(step) / float(max(1, warmup))
+            progress = float(step - warmup) / float(max(1, decay_steps - warmup))
+            progress = min(progress, 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+        return LambdaLR(optimizer, lr_lambda)
+
+    if stype in ("global_cosine", "clamped_global_cosine"):
+        # Clamp-floored global cosine (SpeCo ClampedGlobalCosineLR).
+        def lr_lambda(step):
+            step = max(int(step), 0)
+            if warmup > 0 and step < warmup:
+                return float(step) / float(warmup)
+            span = decay_steps - warmup
+            progress = min(max(step - warmup, 0) / max(span, 1), 1.0)
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_ratio + (1.0 - min_ratio) * cosine
+        return LambdaLR(optimizer, lr_lambda)
+
+    raise ValueError(f"eagle3: unknown draft_lr_scheduler_type {stype!r}; choose constant/cosine/global_cosine")
 
 
 def unwrap_draft(draft_module):
@@ -919,24 +984,32 @@ def eagle3_backward_step(engine) -> Optional[float]:
 
     # ========== ORIGINAL CODE (commented out for experiment) ==========
     draft_loss.backward()
-    logger.warning("-" * 50)
-    logger.warning("DRAFT-TRAIN: draft backward done, draft_loss=%f", draft_loss.item())
-    logger.warning("-" * 50)
-    
+
     clip = engine.model_config.eagle3.draft_optim_clip_grad
     if clip and clip > 0:
         torch.nn.utils.clip_grad_norm_(state.draft_module.parameters(), max_norm=clip)
-    
+
     # optim state must be on-device for step(); park it back on CPU afterwards.
     if getattr(state, "optim_offload", False):
         _load_draft_optimizer(state.draft_optimizer)
     state.draft_optimizer.step()
     if getattr(state, "optim_offload", False):
         _offload_draft_optimizer(state.draft_optimizer)
-    
-    logger.warning("-" * 50)
-    logger.warning("DRAFT-METRIC: draft_loss calculated = %f", draft_loss.item())
-    logger.warning("-" * 50)
+
+    # LR scheduler step（#1：对标 SpeCo base_trainer.py:3430）.
+    if state.draft_lr_scheduler is not None:
+        state.draft_lr_scheduler.step()
+
+    # 记录本次成功更新的 global_step，供 get_per_tensor_param 判断是否需要导出
+    # draft 权重（#2：只在训过的步同步，避免每步都搬未改变的权重到 rollout）。
+    # global_step 由 train_draft_from_store 传入，这里从 engine 上取回。
+    # 若拿不到则用 -1 之外的哨兵以免误判，但始终触发一次同步确保安全。
+    _last_step = getattr(engine, "_eagle3_last_global_step", None)
+    if _last_step is not None:
+        state.last_trained_global_step = int(_last_step)
+
+    logger.warning("DRAFT-METRIC: draft_loss=%f lr=%.2e",
+                   draft_loss.item(),
+                   state.draft_optimizer.param_groups[0]["lr"])
     return float(draft_loss.detach().item())
-    # ========== END ORIGINAL CODE ==========
 

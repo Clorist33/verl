@@ -975,12 +975,29 @@ class MegatronEngine(BaseEngine):
         # prefix. The draft is NOT a policy submodule (it is held via a list wrapper
         # in eagle3_patch to keep it out of named_parameters()), so the base export
         # above never walks it and no detach/restore guard is needed.
+        #
+        # (#2) Only export draft weights when draft was actually trained this step
+        # (last_trained_global_step matches the current step). Exporting on steps
+        # where draft was skipped wastes bandwidth and lacks "trained or not"
+        # semantics -- mirrors SpeCo's maybe_publish guard (speco_worker.py:933).
+        # The current global_step is available as _eagle3_last_global_step set by
+        # update_draft_deferred before eagle3_backward_step runs.
         if getattr(self, "_eagle3", None) is not None and self._eagle3.enabled:
             eagle3_cfg = getattr(self.model_config, "eagle3", None)
             if eagle3_cfg is not None and eagle3_cfg.enable_rollout:
-                from itertools import chain
+                current_step = getattr(self, "_eagle3_last_global_step", None)
+                trained_step = getattr(self._eagle3, "last_trained_global_step", -1)
+                should_export = (current_step is None) or (trained_step == current_step)
+                if not should_export:
+                    logger.warning(
+                        "EAGLE3: skipping draft weight export at step %s "
+                        "(last trained at step %s) -- draft not updated this step.",
+                        current_step, trained_step,
+                    )
+                else:
+                    from itertools import chain
 
-                from verl.models.eagle3.engine_support import export_draft_weights, unwrap_draft
+                    from verl.models.eagle3.engine_support import export_draft_weights, unwrap_draft
 
                 logger.warning("-" * 50)
                 logger.warning("DRAFT-TRAIN: exporting draft weights to vLLM, eagle3.enabled=%s, enable_rollout=%s",

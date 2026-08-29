@@ -126,6 +126,8 @@ class _FakeState:
         self.draft_optimizer = torch.optim.SGD(draft.parameters(), lr=0.0)
         self.frozen_lm_head = None
         self.optim_offload = False
+        self.draft_lr_scheduler = None  # #1 LR scheduler optional
+        self.last_trained_global_step = -1  # #2 weight-sync guard
 
 
 class _FakeEngine:
