@@ -160,6 +160,13 @@ class ActorConfig(BaseConfig):
     draft_ppo_micro_batch_size_per_gpu: Optional[int] = None
     draft_ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
 
+    # === V3 延后训练的 SpeCo 式内循环（P1-2）===
+    # 一次 draft 触发做 draft_steps_per_trigger 次独立 optimizer step，每次从本步
+    # 采集的窗口池随机采 draft_train_batch_size_per_gpu 个窗口（无放回，跨步重采）。
+    # 对标 verl-SpeCo speco_base.yaml 的 training.step=10 / batch_size_per_gpu=4。
+    draft_steps_per_trigger: int = 10
+    draft_train_batch_size_per_gpu: int = 4
+
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384

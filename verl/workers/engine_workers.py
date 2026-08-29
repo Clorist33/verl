@@ -918,15 +918,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
         micro_bsz = getattr(self.actor_config, "draft_ppo_micro_batch_size_per_gpu", None)
+        # SpeCo 式内循环参数（P1-2）：一次触发做 steps 次独立更新，每次从本步窗口池
+        # 随机采 batch 个窗口（对标 speco_base.yaml 的 training.step / batch_size_per_gpu）。
+        steps_per_trigger = int(getattr(self.actor_config, "draft_steps_per_trigger", None) or 10)
+        train_bsz = getattr(self.actor_config, "draft_train_batch_size_per_gpu", None)
+        train_bsz = int(train_bsz) if train_bsz else 4
 
         with self.engine.train_mode(disable_auto_offload=True), Timer(name="draft_deferred", logger=None) as timer:
-            draft_loss = train_draft_from_store(
-                engine, state.feature_store, micro_batch_size=micro_bsz, global_step=global_step
+            result = train_draft_from_store(
+                engine,
+                state.feature_store,
+                micro_batch_size=micro_bsz,
+                global_step=global_step,
+                steps_per_trigger=steps_per_trigger,
+                batch_size_per_gpu=train_bsz,
             )
 
-        if draft_loss is None or not self.engine.is_mp_src_rank_with_outputs():
+        if result is None or not self.engine.is_mp_src_rank_with_outputs():
             return None
-        metrics = {"draft_loss": [draft_loss], "draft_time_s": [timer.last]}
+        losses = result["losses"]
+        metrics = {
+            # draft_loss 取触发内均值；first/last 用于观察单次触发内是否真的在学
+            "draft_loss": [sum(losses) / len(losses)],
+            "draft_loss_first": [losses[0]],
+            "draft_loss_last": [losses[-1]],
+            "draft_updates": [float(len(losses))],
+            "draft_windows": [float(result["num_windows"])],
+            "draft_time_s": [timer.last],
+        }
         return tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

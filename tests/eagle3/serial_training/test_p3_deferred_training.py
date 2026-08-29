@@ -167,15 +167,45 @@ def _engine_with(records, head=True):
     return engine, store, draft
 
 
-def test_training_runs_and_returns_a_loss(patched):
+def test_training_runs_and_returns_losses(patched):
     from verl.models.eagle3.deferred_training import train_draft_from_store
 
     engine, store, draft = _engine_with([_record(fill=0.5) for _ in range(4)])
-    loss = train_draft_from_store(engine, store, global_step=1)
+    result = train_draft_from_store(engine, store, global_step=1)
 
-    assert isinstance(loss, float)
+    assert isinstance(result, dict)
+    assert len(result["losses"]) == 1 and isinstance(result["losses"][0], float)
+    assert result["num_windows"] == 4
     assert len(store) == 0, "store must be drained"
     assert draft.seen == [(4, ROWS, AUX_DIM)], "one chunk by default"
+
+
+def test_speco_inner_loop_multiple_updates_with_sampling(patched):
+    """P1-2: steps_per_trigger independent updates, each on a random sub-batch.
+
+    Mirrors SpeCo speco_worker.py:887-891 + base_trainer.py:2580: pool of 6,
+    batch 4, 3 steps -> 3 optimizer steps, each forwarding exactly 4 windows.
+    """
+    from verl.models.eagle3.deferred_training import train_draft_from_store
+
+    engine, store, draft = _engine_with([_record() for _ in range(6)])
+    result = train_draft_from_store(
+        engine, store, global_step=1, steps_per_trigger=3, batch_size_per_gpu=4
+    )
+    assert len(result["losses"]) == 3
+    assert draft.seen == [(4, ROWS, AUX_DIM)] * 3
+
+
+def test_inner_loop_uses_whole_pool_when_batch_exceeds_it(patched):
+    """batch >= pool degrades to full-pool steps (SpeCo _sample_training_items:2540)."""
+    from verl.models.eagle3.deferred_training import train_draft_from_store
+
+    engine, store, draft = _engine_with([_record() for _ in range(3)])
+    result = train_draft_from_store(
+        engine, store, global_step=1, steps_per_trigger=2, batch_size_per_gpu=8
+    )
+    assert len(result["losses"]) == 2
+    assert draft.seen == [(3, ROWS, AUX_DIM)] * 2
 
 
 def test_micro_batch_size_splits_the_forward(patched):

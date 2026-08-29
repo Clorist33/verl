@@ -201,29 +201,45 @@ def train_draft_from_store(
     micro_batch_size: Optional[int] = None,
     global_step: Optional[int] = None,
     frozen_head=None,
-) -> Optional[float]:
-    """Train the draft on this step's stashed features. Returns the loss, or None.
+    steps_per_trigger: int = 1,
+    batch_size_per_gpu: Optional[int] = None,
+) -> Optional[dict]:
+    """Train the draft on this step's stashed features (SpeCo-style inner loop).
 
     Call once per draft-training step, after ``update_actor`` returns.
 
-    Micro-batches are forwarded separately but backwarded together: each chunk
-    stashes its loss and a single ``eagle3_backward_step`` averages them. That
-    keeps the reduction identical to the in-forward path, at the cost of holding
-    every chunk's graph until the end. At the design's sizing -- 16 windows of
-    513 rows against a 278M-param draft -- that is a small graph; if the window
-    or sample budget grows enough to matter, this is the place to switch to
-    per-chunk backward with gradient accumulation.
+    Mirrors verl-SpeCo's trigger semantics (``speco_worker.py:887-891`` +
+    ``base_trainer.py:3359``): one trigger runs ``steps_per_trigger`` independent
+    optimizer steps; each step draws ``batch_size_per_gpu`` windows at random
+    (without replacement, ``_sample_training_items`` style) from this step's
+    pool, forwards them, and does a full backward + clip + optimizer.step via
+    ``eagle3_backward_step``. Windows get revisited across the inner steps --
+    that resampling is where SpeCo's drafter gets its learning throughput
+    (P1-2: one pass over the pool is ~10x fewer updates than the reference).
+
+    The defaults (1 step, whole pool) keep the old single-update behaviour for
+    direct callers/tests; ``update_draft_deferred`` passes the SpeCo-aligned
+    config values (10 steps of 4 windows).
+
+    Within one inner step, ``micro_batch_size`` still chunks the step's batch
+    for forward memory; the chunks' losses are averaged into that step's single
+    backward, exactly as before.
 
     Args:
         engine: the Megatron engine carrying ``_eagle3``.
         store: :class:`~verl.models.eagle3.feature_store.DraftFeatureStore`;
             drained here, so a second call in the same step is a no-op.
         micro_batch_size: windows per forward chunk; ``None`` = one chunk.
-        global_step: for logging and the staleness check against the snapshot.
+        global_step: for logging, the snapshot staleness check, and the
+            deterministic sampling seed.
         frozen_head: override the snapshot on ``state.frozen_lm_head``.
+        steps_per_trigger: optimizer steps per trigger (SpeCo ``training.step``).
+        batch_size_per_gpu: windows per inner step (SpeCo ``batch_size_per_gpu``);
+            ``None`` = the whole pool every step.
 
     Returns:
-        Mean draft loss, or ``None`` when there was nothing to train on.
+        ``{"losses": [per-update loss...], "num_windows": N}``, or ``None`` when
+        there was nothing to train on.
 
     Raises:
         RuntimeError: if features exist but no teacher snapshot does -- training
@@ -231,6 +247,8 @@ def train_draft_from_store(
             the policy head would silently reintroduce the extra forward this
             design removes.
     """
+    import random
+
     from verl.models.eagle3.engine_support import _unwrap_gpt, eagle3_backward_step
     from verl.models.eagle3.loss_mcore import compute_draft_loss
     from verl.models.mcore.eagle3_patch import stash_draft_loss
@@ -299,50 +317,77 @@ def train_draft_from_store(
     gamma = getattr(gpt, "_eagle3_gamma", 0.8)
     temperature = getattr(gpt, "_eagle3_temperature", 1.0)
 
-    n_chunks = 0
-    for chunk in _chunks(records, micro_batch_size):
-        batch = stack_records(chunk, device=device, dtype=dtype)
+    def _forward_and_stash(batch_records) -> int:
+        """Forward the given windows (chunked) and stash each chunk's loss."""
+        n = 0
+        for chunk in _chunks(batch_records, micro_batch_size):
+            batch = stack_records(chunk, device=device, dtype=dtype)
 
-        # Teacher rebuilt from the stashed pre-lm_head hidden, in draft-vocab
-        # width. compute_draft_loss accepts a pre-filtered teacher unchanged
-        # (loss_mcore.py:87-89), so no t2d selection is needed here.
-        teacher_logits = head(batch["final_hidden"])
+            # Teacher rebuilt from the stashed pre-lm_head hidden, in draft-vocab
+            # width. compute_draft_loss accepts a pre-filtered teacher unchanged
+            # (loss_mcore.py:87-89), so no t2d selection is needed here.
+            teacher_logits = head(batch["final_hidden"])
 
-        draft_out = draft(
-            input_ids=batch["input_ids"],
-            hidden_states=batch["aux_hidden"],
-            loss_mask=batch["loss_mask"],
-            attention_mask=None,
-            position_ids=batch["position_ids"],
-            ttt_length=ttt_length,
-        )
-        loss_out = compute_draft_loss(
-            student_logits_per_step=draft_out["logits"],
-            teacher_logits=teacher_logits,
-            t2d=draft.t2d,
-            loss_mask=batch["loss_mask"],
-            position_masks_per_step=draft_out.get("position_masks"),
-            gamma=gamma,
-            temperature=temperature,
-        )
-        # Stash through the paired helper rather than touching the attribute:
-        # eagle3_backward_step drains via _get_patching_model, while `gpt` here
-        # came from _unwrap_gpt. The two resolve independently, and a mismatch
-        # would park the loss where nothing drains it -- draft never backwards,
-        # nothing raises.
-        if not stash_draft_loss(gpt, loss_out["loss"]):
-            raise RuntimeError(
-                f"[DRAFT-TRAIN-V3] step {global_step}: could not stash the draft loss on "
-                f"{type(gpt).__name__}. eagle3_backward_step would find nothing to backward "
-                "and report success on a step that trained nothing."
+            draft_out = draft(
+                input_ids=batch["input_ids"],
+                hidden_states=batch["aux_hidden"],
+                loss_mask=batch["loss_mask"],
+                attention_mask=None,
+                position_ids=batch["position_ids"],
+                ttt_length=ttt_length,
             )
-        n_chunks += 1
+            loss_out = compute_draft_loss(
+                student_logits_per_step=draft_out["logits"],
+                teacher_logits=teacher_logits,
+                t2d=draft.t2d,
+                loss_mask=batch["loss_mask"],
+                position_masks_per_step=draft_out.get("position_masks"),
+                gamma=gamma,
+                temperature=temperature,
+            )
+            # Stash through the paired helper rather than touching the attribute:
+            # eagle3_backward_step drains via _get_patching_model, while `gpt` here
+            # came from _unwrap_gpt. The two resolve independently, and a mismatch
+            # would park the loss where nothing drains it -- draft never backwards,
+            # nothing raises.
+            if not stash_draft_loss(gpt, loss_out["loss"]):
+                raise RuntimeError(
+                    f"[DRAFT-TRAIN-V3] step {global_step}: could not stash the draft loss on "
+                    f"{type(gpt).__name__}. eagle3_backward_step would find nothing to backward "
+                    "and report success on a step that trained nothing."
+                )
+            n += 1
+        return n
+
+    # Deterministic sampling: same seed on every DP rank so all ranks run the
+    # same number of (symmetric) backwards; the pools themselves are rank-local,
+    # so identical seeds do not correlate the data.
+    steps = max(int(steps_per_trigger), 1)
+    rng = random.Random(1000003 * int(global_step or 0) + 7)
+    losses: list[float] = []
+    for _ in range(steps):
+        if batch_size_per_gpu and len(records) > int(batch_size_per_gpu):
+            batch_records = rng.sample(records, int(batch_size_per_gpu))
+        else:
+            batch_records = records
+        _forward_and_stash(batch_records)
+        # Reuse the verified optimizer half: drain -> mean -> backward -> clip -> step.
+        loss_val = eagle3_backward_step(engine)
+        if loss_val is None:
+            raise RuntimeError(
+                f"[DRAFT-TRAIN-V3] step {global_step}: eagle3_backward_step found no stashed "
+                "loss right after stashing -- something drained it in between."
+            )
+        losses.append(float(loss_val))
 
     logger.warning(
-        "[DRAFT-TRAIN-V3] step %s: %d window(s) in %d chunk(s) -> backward",
+        "[DRAFT-TRAIN-V3] step %s: %d window(s), %d optimizer step(s) of %s window(s) each; "
+        "loss first=%.4f last=%.4f",
         global_step,
         len(records),
-        n_chunks,
+        steps,
+        batch_size_per_gpu or len(records),
+        losses[0],
+        losses[-1],
     )
-    # Reuse the verified optimizer half: drain -> mean -> backward -> clip -> step.
-    return eagle3_backward_step(engine)
+    return {"losses": losses, "num_windows": len(records)}
