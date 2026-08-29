@@ -368,9 +368,32 @@ def _eagle3_draft_forward_and_stash_loss(
     eagle_loss_mask = loss_mask
     if eagle_loss_mask.dim() == 1:
         eagle_loss_mask = eagle_loss_mask.unsqueeze(0)
+    draft_input_ids = input_ids if input_ids.dim() == 2 else input_ids.unsqueeze(0)
+
+    # ---- EAGLE 对齐：token 相对 hidden 左移一位（P1-1 修复，2026-08-29）----
+    # 推理时（vllm-ascend llm_base_proposer.py:1434 "Shift the input ids by one
+    # token"）draft 的一步输入是 (f[p], x[p+1])：hidden 停在 p，token 是刚采样出
+    # 的下一个。训练必须复刻这个差位，否则 draft 学到的融合方式与推理喂法错开
+    # 一格。初始 ckpt 实验实证：正确对齐 loss 0.87/top1 79%，不移位 loss 9.28/
+    # top1 6.9%（开发过程记录/串行训练/串行版本2/P1-1对齐核实结论-20260829.md）。
+    #
+    # 行 p 的训练样本 = (f[p], x[p+1]) -> P(x[p+2])：
+    #   input_ids 左移一位（末行重复自身，其 teacher 由 shift_teacher_left 的
+    #   valid[:,-1]=False 掐掉，不产生 loss）；
+    #   loss_mask 左移两位取【被预测 token x[p+2]】的掩码（SpeCo 同款语义，
+    #   base_trainer.py:2938 的 mask[2:2+L]），尾部补 0。
+    #
+    # 已知限界：若一个 micro-batch 把多条序列打包进同一行（THD packing），移位在
+    # 序列边界处会串到下一条的开头 —— 这与本函数里 teacher 左移的既有行为一致
+    # （每条序列至多污染 1-2 行，且通常被 loss_mask 的 prompt 段挡住），当前
+    # 配置（micro_batch_size_per_gpu=1，一行一序列）不触发。
+    draft_input_ids = torch.cat([draft_input_ids[:, 1:], draft_input_ids[:, -1:]], dim=1)
+    eagle_loss_mask = torch.cat(
+        [eagle_loss_mask[:, 2:], eagle_loss_mask.new_zeros(eagle_loss_mask.shape[0], 2)], dim=1
+    )
 
     draft_out = draft(
-        input_ids=input_ids,
+        input_ids=draft_input_ids,
         hidden_states=aux_hidden,
         loss_mask=eagle_loss_mask,
         attention_mask=None,

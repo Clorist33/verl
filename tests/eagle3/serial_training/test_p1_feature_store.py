@@ -117,17 +117,26 @@ def _plan_for(prompt_lens, response_lens, rows=6, step=1, **kw):
 
 
 def test_collected_rows_match_the_plan_positions():
-    """The stashed rows must be exactly the ones the plan asked for."""
+    """Hiddens come from the plan's rows; tokens/mask are EAGLE-shifted (P1-1).
+
+    Row i must hold (aux f[p_i], final f[p_i], token x[p_i + 1]) with the mask of
+    the predicted token x[p_i + 2] -- the pairing the inference proposer feeds
+    (llm_base_proposer.py:1434). input_ids is arange, so the expected gather at
+    pos + 1 is literally pos + 1.
+    """
     plan = _plan_for([3] * B, [30] * B, rows=6)
     aux, final = _hidden(), _hidden(dim=H)
     store = DraftFeatureStore()
     store.begin_step(1)
 
+    loss_mask = torch.ones(B, S, dtype=torch.bool)
+    loss_mask[:, 5] = False  # 让 mask 的移位可被观测：p_i + 2 == 5 的行应取到 False
+
     n = collect_draft_features(
         store=store, aux_hidden=aux, final_hidden=final,
         input_ids=torch.arange(S).repeat(B, 1),
         position_ids=torch.arange(S).repeat(B, 1),
-        loss_mask=torch.ones(B, S, dtype=torch.bool),
+        loss_mask=loss_mask,
         plan=plan, global_step=1,
     )
     assert n == B
@@ -138,7 +147,38 @@ def test_collected_rows_match_the_plan_positions():
         # value encoding lets us verify identity, not just shape
         torch.testing.assert_close(rec.aux_hidden, aux.transpose(0, 1)[b].index_select(0, pos))
         torch.testing.assert_close(rec.final_hidden, final.transpose(0, 1)[b].index_select(0, pos))
-        torch.testing.assert_close(rec.input_ids, pos)
+        # token 左移一位：行 i = x[p_i + 1]
+        torch.testing.assert_close(rec.input_ids, pos + 1)
+        # 掩码 = 被预测 token x[p_i + 2] 的掩码
+        expected_mask = loss_mask[b].index_select(0, (pos + 2).clamp(max=S - 1))
+        expected_mask = expected_mask & ((pos + 2) <= (S - 1))
+        torch.testing.assert_close(rec.loss_mask.bool(), expected_mask)
+
+
+def test_mask_positions_past_sequence_end_are_zeroed():
+    """A window flush against the sequence end has rows whose predicted token
+    x[p+2] does not exist; their mask must be 0, not garbage."""
+    # prompt=3, response=7, rows=6+1=7: window = positions 2..8, seq exactly 10.
+    seq = 10
+    plan = _plan_for([3], [7], rows=6)
+    assert int(plan.hidden_positions[0].max()) == 8
+    store = DraftFeatureStore()
+    store.begin_step(1)
+    n = collect_draft_features(
+        store=store,
+        aux_hidden=_hidden(seq=seq, batch=1),
+        final_hidden=_hidden(seq=seq, batch=1, dim=H),
+        input_ids=torch.arange(seq).repeat(1, 1),
+        position_ids=None,
+        loss_mask=torch.ones(1, seq, dtype=torch.bool),
+        plan=plan, global_step=1,
+    )
+    assert n == 1
+    rec = store.drain()[0]
+    # 末行 p=8：x[10] 不存在 -> mask 必须为 0；其余行 mask=1
+    assert rec.loss_mask.bool().tolist() == [True] * 6 + [False]
+    # token 行 i = x[p_i + 1]，末行取 x[9]（存在，仍在界内）
+    torch.testing.assert_close(rec.input_ids, plan.hidden_positions[0] + 1)
 
 
 def test_unselected_samples_are_skipped():
@@ -232,7 +272,8 @@ def test_1d_position_and_mask_are_broadcast():
         plan=plan, global_step=1,
     )
     for rec, b in zip(store.drain(), range(B)):
-        torch.testing.assert_close(rec.position_ids, plan.hidden_positions[b])
+        # position_ids 取的是移位后 token（x[p+1]）的位置，故为 pos + 1
+        torch.testing.assert_close(rec.position_ids, plan.hidden_positions[b] + 1)
 
 
 def test_out_of_range_position_names_the_gather():

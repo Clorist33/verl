@@ -55,8 +55,15 @@ class DraftFeatureRecord:
             frozen ``lm_head`` copy at training time to rebuild teacher logits.
             Stored instead of the logits themselves: full-vocab logits are
             ``rows x 151936``, three orders of magnitude larger.
-        input_ids / position_ids / loss_mask: ``(rows,)`` draft forward inputs.
-        positions: ``(rows,)`` absolute sequence positions this window covers.
+        input_ids: ``(rows,)`` -- **shifted one position left of the hiddens**:
+            row ``i`` holds ``x[positions[i] + 1]``, the EAGLE pairing the
+            inference proposer feeds (``llm_base_proposer.py:1434``). Stored
+            pre-shifted so training consumes records verbatim.
+        position_ids: ``(rows,)`` -- RoPE positions of the (shifted) tokens.
+        loss_mask: ``(rows,)`` -- mask of the PREDICTED token ``x[positions[i]+2]``
+            (SpeCo's ``mask[2:2+L]`` semantics); 0 where that position falls past
+            the sequence end.
+        positions: ``(rows,)`` absolute sequence positions of the HIDDEN rows.
         global_step: step that produced the record; used to enforce the
             one-step lifetime.
     """
@@ -255,9 +262,10 @@ def collect_draft_features(
         if not bool(plan.collect_mask[batch_idx]):
             continue
         positions = plan.hidden_positions[batch_idx]
-        if int(positions.max()) >= seq_len:
+        # +1：input_ids 要取 positions+1 处的 token（见下），所以边界多留一格。
+        if int(positions.max()) + 1 >= seq_len:
             raise IndexError(
-                f"[DRAFT-COLLECT] sample {batch_idx} wants position {int(positions.max())} "
+                f"[DRAFT-COLLECT] sample {batch_idx} wants token position {int(positions.max()) + 1} "
                 f"but the gathered sequence is only {seq_len} long. Either the collect "
                 "plan was built from different lengths than this forward saw, or the "
                 "sequence-parallel gather did not run (sequence_parallel="
@@ -269,28 +277,43 @@ def collect_draft_features(
         pos_row = _row(position_ids, batch_idx)
         mask_row = _row(loss_mask, batch_idx)
 
+        # ---- EAGLE 对齐：token 相对 hidden 左移一位（P1-1 修复，2026-08-29）----
+        # 存储即对齐：记录行 i 存 (aux f[p_i], final f[p_i], token x[p_i + 1])，
+        # 与 vLLM 推理喂法（llm_base_proposer.py:1434）和并行路径
+        # （eagle3_patch._eagle3_draft_forward_and_stash_loss 的移位）一致，
+        # 训练侧（train_draft_from_store）直接喂、零特判。
+        # loss_mask 存【被预测 token x[p_i + 2]】的掩码（SpeCo base_trainer.py:2938
+        # 的 mask[2:2+L] 同款语义）；p_i + 2 可能越过序列末尾（窗口贴着 response
+        # 结尾时），越界行补 0 —— 该行本来就没有可训练目标。
+        idx_tok = idx + 1
+        mask_positions = (idx + 2).clamp(max=seq_len - 1)
+        mask_oob = (idx + 2) > (seq_len - 1)
+
+        if mask_row is not None:
+            shifted_mask = mask_row.index_select(0, mask_positions.to(mask_row.device)).detach().to("cpu")
+            shifted_mask = shifted_mask * (~mask_oob.cpu()).to(shifted_mask.dtype)
+        else:
+            shifted_mask = (~mask_oob.cpu()).to(torch.bool)
+
         record = DraftFeatureRecord(
             # .detach() guards the case where a caller passes a live activation:
             # a stashed tensor must never keep the policy graph alive.
             aux_hidden=aux_hidden[batch_idx].index_select(0, idx).detach().to("cpu"),
             final_hidden=final_hidden[batch_idx].index_select(0, idx).detach().to("cpu"),
-            input_ids=ids_row.index_select(0, idx.to(ids_row.device)).detach().to("cpu"),
+            input_ids=ids_row.index_select(0, idx_tok.to(ids_row.device)).detach().to("cpu"),
             # verl's THD forward passes position_ids=None outside MTP training
             # (model_forward.py:366), so pos_row is normally absent. Fall back to
             # the window's own absolute positions + 1 rather than zeros: that is
             # what verl-SpeCo stores (eagle3_trainer_backend.py:820-822), and the
             # draft uses it to offset RoPE so the window carries the phase range it
             # will meet at inference. Zeros would pin every window to position 0.
+            # 注意 +1 恰好也是移位后 token x[p_i+1] 的自然位置。
             position_ids=(
-                pos_row.index_select(0, idx.to(pos_row.device)).detach().to("cpu")
+                pos_row.index_select(0, idx_tok.to(pos_row.device)).detach().to("cpu")
                 if pos_row is not None
                 else (positions.detach().to("cpu") + 1)
             ),
-            loss_mask=(
-                mask_row.index_select(0, idx.to(mask_row.device)).detach().to("cpu")
-                if mask_row is not None
-                else torch.ones(idx.numel(), dtype=torch.bool)
-            ),
+            loss_mask=shifted_mask,
             positions=positions.detach().to("cpu"),
             global_step=global_step,
         )
