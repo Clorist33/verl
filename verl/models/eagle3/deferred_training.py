@@ -99,6 +99,48 @@ def _chunks(seq, size):
         yield seq[i : i + size]
 
 
+def _dp_all_ranks_ready(has_records: bool) -> bool:
+    """MIN-reduce readiness over the draft's data-parallel group.
+
+    The draft is DDP-wrapped over the DP group (engine_support._wrap_draft_ddp),
+    so its backward runs a gradient all-reduce across those ranks. Each rank
+    harvests its own windows, and nothing guarantees uniformity: one rank's
+    samples can all fail the collect plan's length gate while a peer's do not.
+    If the non-empty ranks backward alone, they block forever on that
+    all-reduce -- the empty rank never joins.
+
+    So every rank must make the same train-or-skip decision. This mirrors
+    verl-SpeCo's ``DrafterBaseTrainer._sync_batch_readiness``
+    (``base_trainer.py:3208``): reduce a readiness flag with MIN, and if any
+    rank is empty, all ranks skip together.
+
+    TP peers inside one DP rank hold identical stores (they see the same
+    micro-batches and gather the same full-sequence hidden), so reducing over
+    the DP group alone is sufficient. Single-process / uninitialized runs
+    degrade to the local answer.
+    """
+    import torch.distributed as dist
+
+    if not dist.is_available() or not dist.is_initialized():
+        return has_records
+    try:
+        from megatron.core import parallel_state as mpu
+
+        group = mpu.get_data_parallel_group()
+    except Exception:  # pragma: no cover - no-megatron unit-test paths
+        return has_records
+    if group is None or dist.get_world_size(group) == 1:
+        return has_records
+
+    from verl.utils.device import get_device_id, get_device_name
+
+    device_name = get_device_name()
+    device = torch.device("cpu") if device_name == "cpu" else torch.device(f"{device_name}:{get_device_id()}")
+    flag = torch.tensor([1 if has_records else 0], dtype=torch.int32, device=device)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
 def refresh_frozen_teacher_head(engine, global_step: Optional[int] = None):
     """Re-snapshot the policy ``lm_head`` onto ``engine._eagle3.frozen_lm_head``.
 
@@ -198,13 +240,26 @@ def train_draft_from_store(
         return None
 
     records = store.drain()
-    if not records:
-        logger.warning(
-            "[DRAFT-TRAIN-V3] step %s: feature store is empty, nothing to train. "
-            "Either no sample passed the collect plan's length gate, or collection "
-            "did not run on this step.",
-            global_step,
-        )
+
+    # Train-or-skip must be decided identically on every DP rank BEFORE any
+    # forward/backward: an uneven decision hangs the draft DDP all-reduce.
+    if not _dp_all_ranks_ready(bool(records)):
+        if records:
+            logger.warning(
+                "[DRAFT-TRAIN-V3] step %s: skipping draft training -- a peer DP rank "
+                "collected no windows (its samples all failed the length gate), and "
+                "training without it would hang the draft DDP gradient all-reduce. "
+                "%d local window(s) dropped.",
+                global_step,
+                len(records),
+            )
+        else:
+            logger.warning(
+                "[DRAFT-TRAIN-V3] step %s: feature store is empty, nothing to train. "
+                "Either no sample passed the collect plan's length gate, or collection "
+                "did not run on this step.",
+                global_step,
+            )
         return None
 
     head = frozen_head if frozen_head is not None else getattr(state, "frozen_lm_head", None)

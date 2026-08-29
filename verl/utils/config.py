@@ -26,20 +26,21 @@ __all__ = ["omega_conf_to_dataclass", "validate_config", "_validate_eagle3_seria
 def _validate_eagle3_serial_training_config(config: DictConfig) -> None:
     """在训练启动前（worker初始化之前）验证 EAGLE3 串行训练配置
 
-    串行模式要求：
-    1. 必须设置 actor_training_steps
-    2. total_training_steps 必须是 (k+1) 的整数倍（周期对齐）
+    v3 语义（draft 搭 actor 步的车，不占独立 global step）：
+    - 每一步都是完整的 Actor 步；每 k 步（global_steps % k == 0）额外采集特征并训练一次 draft
+    - total_training_steps = actor_training_steps（不再是 v1/v2 的 actor + draft）
+    - draft_training_steps = actor_training_steps // k，是「draft 被训练的次数」而非步数
+    - 调度周期是 **k**（见 SerialTrainingScheduler.should_train_draft），不是 v1/v2 的 k+1
 
-    推导关系：
-    - draft_training_steps = actor_training_steps // k
-    - total_training_steps = actor_training_steps + draft_training_steps
-    - 周期 = k+1（k 个 Actor 步 + 1 个 Draft 步）
+    硬校验只有两条：actor_training_steps 必须设置、k 必须 >= 1。
+    整除性（actor_training_steps % k）只发 warning 不拦启动：v3 里不整除仅意味着
+    最后一个不完整周期少训一次 draft，没有任何正确性问题。
 
     Args:
         config: Hydra 配置对象
 
     Raises:
-        ValueError: 配置不合法时抛出，包含详细的错误说明和修复建议
+        ValueError: 缺少 actor_training_steps 或 k < 1 时抛出
     """
     # 检查是否启用串行训练
     eagle3_config = config.algorithm.get('eagle3', {})
@@ -56,57 +57,46 @@ def _validate_eagle3_serial_training_config(config: DictConfig) -> None:
             "[Serial Training] 串行训练模式必须设置 'actor_training_steps' 参数。\n"
             "示例配置：\n"
             "trainer:\n"
-            "  actor_training_steps: 100  # Actor 训练步数（建议设为 k 的倍数）\n"
+            "  actor_training_steps: 100  # 总训练步数（v3 下每步都是 Actor 步）\n"
             "algorithm:\n"
             "  eagle3:\n"
             "    enable_serial_training: true\n"
-            "    actor_steps_per_draft_step: 5  # k=5，周期为 k+1=6"
+            "    actor_steps_per_draft_step: 5  # k=5，每 5 步额外训一次 draft"
         )
 
-    # 3. 计算推导参数
+    # 3. 验证：k 必须是正整数（k<1 会让调度器的 global_steps % k 直接除零或永不触发）
+    k = int(k)
+    if k < 1:
+        raise ValueError(
+            f"[Serial Training] actor_steps_per_draft_step 必须 >= 1，当前为 {k}。"
+        )
+
+    # 4. 计算推导参数（v3：total == actor，draft_training_steps 是训练次数）
     draft_training_steps = actor_training_steps // k
-    # v3：draft 搭 actor 步的车，不占独立 global step，所以总步数就是 actor 步数。
     total_training_steps = actor_training_steps
 
-    # 4. 验证：total_training_steps 必须是 (k+1) 的整数倍（周期对齐）
-    period = k + 1
-    if total_training_steps % period != 0:
-        # 计算最接近的合法值
-        cycles_down = total_training_steps // period
-        cycles_up = cycles_down + 1
-        actor_down = cycles_down * k
-        actor_up = cycles_up * k
-        total_down = cycles_down * period
-        total_up = cycles_up * period
-
-        raise ValueError(
-            f"[Serial Training] 配置不合法：\n"
-            f"  actor_training_steps = {actor_training_steps}\n"
-            f"  draft_training_steps = {draft_training_steps} (计算值: actor_training_steps // k)\n"
-            f"  total_training_steps = {total_training_steps} (计算值: actor + draft)\n"
-            f"  周期 (k+1) = {period}\n"
-            f"\n"
-            f"❌ 问题：total_training_steps ({total_training_steps}) 不是周期 ({period}) 的整数倍。\n"
-            f"   这会导致最后几步的训练类型不符合预期（Actor/Draft 混乱）。\n"
-            f"\n"
-            f"✅ 建议修改 actor_training_steps 为以下值之一：\n"
-            f"   - {actor_down}  → total={total_down} ({cycles_down} 个完整周期, {cycles_down} 个 Draft 步)\n"
-            f"   - {actor_up}  → total={total_up} ({cycles_up} 个完整周期, {cycles_up} 个 Draft 步)\n"
-            f"\n"
-            f"💡 通用规则：actor_training_steps 设为 k 的倍数，即可保证周期对齐。"
+    # 5. 整除性只提示不拦截：不整除仅让最后一个不完整周期少训一次 draft
+    if actor_training_steps % k != 0:
+        logger.warning(
+            "[Serial Training] actor_training_steps (%d) 不是 k (%d) 的整数倍：最后 %d 步"
+            "构成一个不完整周期，其中不会触发 draft 训练。这不影响正确性；若希望周期对齐，"
+            "可将 actor_training_steps 调整为 %d 或 %d。",
+            actor_training_steps,
+            k,
+            actor_training_steps % k,
+            (actor_training_steps // k) * k,
+            (actor_training_steps // k + 1) * k,
         )
 
-    # 5. 验证通过，输出日志
-    num_cycles = total_training_steps // period
+    # 6. 验证通过，输出日志
     logger.info("=" * 60)
     logger.info("[Serial Training] Configuration validated (before training):")
     logger.info(f"  actor_training_steps:       {actor_training_steps}")
     logger.info(f"  actor_steps_per_draft_step: {k}")
-    logger.info(f"  draft_training_steps:       {draft_training_steps} (calculated)")
-    logger.info(f"  total_training_steps:       {total_training_steps} (calculated)")
+    logger.info(f"  draft_training_steps:       {draft_training_steps} (draft 训练次数 = actor // k)")
+    logger.info(f"  total_training_steps:       {total_training_steps} (v3: 等于 actor_training_steps)")
     logger.info(f"  training_ratio:             Actor:{actor_training_steps} / Draft:{draft_training_steps} = {k}:1")
-    logger.info(f"  period (k+1):               {period} steps/cycle")
-    logger.info(f"  num_cycles:                 {num_cycles} complete cycles")
+    logger.info(f"  period (k):                 每 {k} 步额外训练一次 draft")
     logger.info("=" * 60)
 
 
