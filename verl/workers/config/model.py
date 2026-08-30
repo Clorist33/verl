@@ -97,6 +97,19 @@ class Eagle3Config(BaseConfig):
     # unchanged behavior. Set True to cut draft-path activation peak (P5-09).
     draft_forward_checkpoint: bool = False
 
+    # ---- draft LR scheduler (mirrors verl-SpeCo lr_scheduler.py) ----
+    # Consumed by engine_support._build_draft_lr_scheduler, which is handed this
+    # config object (engine.model_config.eagle3) -- hence these live here beside
+    # draft_optim_*, not on ActorConfig.
+    #   draft_lr_scheduler_type: "constant" | "cosine" | "global_cosine"
+    #   draft_lr_warmup_steps:   linear warmup length, counted in optimizer steps
+    #   draft_lr_decay_steps:    cosine/global_cosine decay horizon
+    #   draft_lr_min_ratio:      lr floor = draft_optim_lr * min_ratio
+    draft_lr_scheduler_type: str = "constant"
+    draft_lr_warmup_steps: int = 0
+    draft_lr_decay_steps: int = 1000
+    draft_lr_min_ratio: float = 0.0
+
     # ---- vocab compression switch ----
     enable_vocab_compression: bool = False
     draft_vocab_size: int = 0
@@ -175,6 +188,25 @@ class Eagle3Config(BaseConfig):
             if self.draft_optim_clip_grad < 0:
                 raise ValueError(
                     f"Eagle3Config: draft_optim_clip_grad must be non-negative, got {self.draft_optim_clip_grad}"
+                )
+            # Fail here rather than deep inside setup_eagle3_training, where the
+            # ValueError would surface as a Ray worker crash mid-initialization.
+            if self.draft_lr_scheduler_type not in ("constant", "cosine", "global_cosine", "clamped_global_cosine"):
+                raise ValueError(
+                    f"Eagle3Config: draft_lr_scheduler_type must be one of "
+                    f"constant/cosine/global_cosine, got {self.draft_lr_scheduler_type!r}"
+                )
+            if self.draft_lr_warmup_steps < 0:
+                raise ValueError(
+                    f"Eagle3Config: draft_lr_warmup_steps must be non-negative, got {self.draft_lr_warmup_steps}"
+                )
+            if self.draft_lr_decay_steps < 1:
+                raise ValueError(
+                    f"Eagle3Config: draft_lr_decay_steps must be >= 1, got {self.draft_lr_decay_steps}"
+                )
+            if not 0.0 <= self.draft_lr_min_ratio <= 1.0:
+                raise ValueError(
+                    f"Eagle3Config: draft_lr_min_ratio must be in [0, 1], got {self.draft_lr_min_ratio}"
                 )
 
         # vocab compression switch

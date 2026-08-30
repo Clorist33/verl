@@ -130,6 +130,18 @@ eagle3:
   # activation-checkpoint the draft backbone (time-for-memory); default off (P5-09)
   draft_forward_checkpoint: False
 
+  # draft LR scheduler (mirrors verl-SpeCo lr_scheduler.py); constant/cosine/global_cosine.
+  # Defaults keep the draft LR flat -- opt into cosine explicitly, and size
+  # draft_lr_warmup_steps against the run's total draft optimizer steps
+  # (draft triggers x draft_steps_per_trigger), not against actor steps.
+  draft_lr_scheduler_type: constant
+
+  draft_lr_warmup_steps: 0
+
+  draft_lr_decay_steps: 1000
+
+  draft_lr_min_ratio: 0.0
+
   # vocab compression switch
   enable_vocab_compression: False
 

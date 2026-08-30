@@ -167,15 +167,12 @@ class ActorConfig(BaseConfig):
     draft_steps_per_trigger: int = 10
     draft_train_batch_size_per_gpu: int = 4
 
-    # === Draft LR scheduler（#1，对标 SpeCo lr_scheduler.py）===
-    # draft_lr_scheduler_type: "constant"（默认，可选 "cosine" / "global_cosine"）
-    # draft_lr_warmup_steps: warmup 步数（optimizer step 计）
-    # draft_lr_decay_steps: cosine/global_cosine 衰减步数
-    # draft_lr_min_ratio:   LR 下限 = base_lr × min_ratio
-    draft_lr_scheduler_type: str = "cosine"
-    draft_lr_warmup_steps: int = 200
-    draft_lr_decay_steps: int = 1000
-    draft_lr_min_ratio: float = 0.0
+    # === Draft LR scheduler ===
+    # 字段已于 20260829 迁到 Eagle3Config（model.eagle3.draft_lr_*），与
+    # draft_optim_lr/weight_decay/clip_grad 同处一个配置对象。原因：调度器由
+    # engine_support.setup_eagle3_training 构建，它只拿得到 engine.model_config.eagle3，
+    # 读不到 ActorConfig —— 定义在这里的四个字段从来没有被读到过，
+    # _build_draft_lr_scheduler 一直在吃 "constant"+warmup=0 的 fallback 并返回 None。
 
     # === V3 采集计划配置面板（#4，对标 SpeCo speco_base.yaml:58-66）===
     # 通过 +actor_rollout_ref.actor.draft_collect_window_train_rows=N 等方式在脚本里覆盖。
