@@ -1,3 +1,5 @@
+# [P3-DEAD 20260829] 调试副本（2026-08-22 抓 draft 权重用），全仓无任何 import 引用。
+# 保留待整体验证通过后删除；请勿在新代码中引用本文件。
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");

@@ -146,7 +146,8 @@ def patch_eagle3_postprocess(
     m._eagle3_collect_features_step = _eagle3_collect_features_step.__get__(m, m.__class__)
     m._eagle3_parallel_training = _eagle3_parallel_training.__get__(m, m.__class__)
     m._eagle3_actor_only_step = _eagle3_actor_only_step.__get__(m, m.__class__)
-    m._eagle3_draft_training_step = _eagle3_draft_training_step.__get__(m, m.__class__)
+    # [P3-DEAD v1/v2 20260829] 绑定的函数本体已注释，整体验证通过后一并删除。
+    # m._eagle3_draft_training_step = _eagle3_draft_training_step.__get__(m, m.__class__)
 
     logger.warning("-" * 50)
     logger.warning("DRAFT-TRAIN: _postprocess hook registered on GPTModel, ttt_length=%d", ttt_length)
@@ -163,7 +164,9 @@ def unpatch_eagle3_postprocess(model: torch.nn.Module):
         del m._postprocess_backup_eagle3
     for attr in ("_eagle3_draft", "_eagle3_capture", "_eagle3_ttt_length",
                  "_eagle3_gamma", "_eagle3_temperature", "_eagle3_draft_losses",
-                 "_eagle3_parallel_training", "_eagle3_actor_only_step", "_eagle3_draft_training_step",
+                 "_eagle3_parallel_training", "_eagle3_actor_only_step",
+                 # [P3-DEAD v1/v2 20260829] 该属性不再绑定，整体验证通过后删除本行。
+                 # "_eagle3_draft_training_step",
                  "_eagle3_collect_features_step", "_eagle3_collect_only", "_eagle3_feature_store",
                  "_eagle3_collect_config"):
         if hasattr(m, attr):
@@ -260,16 +263,19 @@ def _megatron_gptmodel_postprocess_eagle3(
     【路由方法】根据标志决定执行哪种训练模式。
     本方法不包含任何业务逻辑，只做路由判断。
 
-    支持三种模式：
-    1. 串行模式 - Actor 训练步：禁用 draft
-    2. 串行模式 - Draft 训练步：只训练 draft
+    v3 下实际存在三条分支：
+    1. 采集步（collect_only）：只把 draft 训练要的 hidden 采到 host，不训 draft
+    2. 串行模式 - Actor 训练步：禁用 draft
     3. 并行模式（原有）：actor 和 draft 同时训练
+
+    v1/v2 的第四条分支（串行 Draft 训练步）已停用并注释，见下方 P3-DEAD 标记。
     """
     # 提取标志
     # 注意：标志由 transformer_impl.forward_step 挂到模型实例上（见 _eagle3_train_draft_only /
     # _eagle3_enable_draft_training）。不能从 extra_block_kwargs 读——那是 decoder 层的 kwargs，
     # 是个 dict 且从不携带这些自定义标志，getattr 永远拿不到值会导致串行模式静默失效。
-    train_draft_only = getattr(self, "_eagle3_train_draft_only", False)
+    # [P3-DEAD v1/v2 20260829] train_draft_only 目前恒 False，仅为保留下方被注释分支而读取。
+    train_draft_only = getattr(self, "_eagle3_train_draft_only", False)  # noqa: F841
     enable_draft_training = getattr(self, "_eagle3_enable_draft_training", True)
 
     if getattr(self, "_eagle3_collect_only", False):
@@ -279,16 +285,18 @@ def _megatron_gptmodel_postprocess_eagle3(
         return self._eagle3_collect_features_step(
             hidden_states, input_ids, position_ids, loss_mask, runtime_gather_output
         )
-    elif train_draft_only:
-        # === 串行模式：Draft 训练步（只训练 draft）===
-        return self._eagle3_draft_training_step(
-            hidden_states, input_ids, position_ids, labels, rotary_pos_emb,
-            rotary_pos_cos, rotary_pos_sin, mtp_in_postprocess, loss_mask,
-            decoder_input, attention_mask, padding_mask, inference_params,
-            packed_seq_params, sequence_len_offset, runtime_gather_output,
-            extra_block_kwargs, inference_context, output_processor,
-            output_processor_context, is_spec_decode
-        )
+    # [P3-DEAD v1/v2 20260829] 串行 v1/v2 的 Draft 训练步分支。v3 中 train_draft_only 恒 False
+    # （trainer_base.py:817），此分支不可达。整体验证通过后删除。
+#     elif train_draft_only:
+#         # === 串行模式：Draft 训练步（只训练 draft）===
+#         return self._eagle3_draft_training_step(
+#             hidden_states, input_ids, position_ids, labels, rotary_pos_emb,
+#             rotary_pos_cos, rotary_pos_sin, mtp_in_postprocess, loss_mask,
+#             decoder_input, attention_mask, padding_mask, inference_params,
+#             packed_seq_params, sequence_len_offset, runtime_gather_output,
+#             extra_block_kwargs, inference_context, output_processor,
+#             output_processor_context, is_spec_decode
+#         )
     elif not enable_draft_training:
         # === 串行模式：Actor 训练步（禁用 draft）===
         return self._eagle3_actor_only_step(
@@ -578,7 +586,7 @@ def _eagle3_collect_features_step(
         )
         if budget is not None and stored:
             budget.consume(stored, stored * plan.hidden_rows)
-        logger.warning(
+        logger.debug(
             "[DRAFT-COLLECT] step %s: stashed %d/%d window(s) (%d candidates); "
             "step budget left: %s samples / %s rows",
             cfg.get("global_step", 0), stored, plan.selected_count, plan.candidate_count,
@@ -717,120 +725,122 @@ def _eagle3_parallel_training(
     return logits             #返回 policy logits，算的 policy logits 给上层,draft loss 已暂存、走独立通道。
 
 
-def _eagle3_draft_training_step(
-    self,
-    hidden_states,
-    input_ids,
-    position_ids,
-    labels,
-    rotary_pos_emb,
-    rotary_pos_cos,
-    rotary_pos_sin,
-    mtp_in_postprocess,
-    loss_mask,
-    decoder_input,
-    attention_mask,
-    padding_mask,
-    inference_params,
-    packed_seq_params,
-    sequence_len_offset,
-    runtime_gather_output,
-    extra_block_kwargs,
-    inference_context,
-    output_processor,
-    output_processor_context,
-    is_spec_decode,
-):
-    """串行模式 - Draft 训练步：只训练 draft，Actor 冻结（新增方法）
-
-    执行流程：
-    1. Actor forward（冻结参数，生成 teacher logits）
-    2. Draft forward + loss 计算
-    3. Draft backward + 参数更新
-
-    与并行模式的区别：
-    - Actor 参数冻结，只做前向传播生成 teacher
-    - 只有 Draft 参与梯度计算和参数更新
-    """
-    output_weight = None
-    if self.share_embeddings_and_output_weights:
-        output_weight = self.shared_embedding_or_output_weight()
-
-    if not self.post_process:
-        return hidden_states
-
-    # 1. 计算 policy logits（Actor 前向，用作 teacher）
-    logits, _ = self.output_layer(hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
-    logits = logits.transpose(0, 1).contiguous()  # [s b v] -> [b s v]
-
-    # 2. Draft 训练流程
-    draft_list = getattr(self, "_eagle3_draft", None)
-    capture = getattr(self, "_eagle3_capture", None)
-
-    # _eagle3_draft 是单元素列表 [draft_module]，需要解包
-    if draft_list is None or not draft_list or capture is None:
-        logger.warning("[DRAFT-TRAIN-SERIAL] Draft or capture not available, skipping draft training")
-        return logits
-
-    if not self.training:
-        # 与并行路径的四重门禁对齐（并行见 _eagle3_parallel_training 的 gate）。
-        # eval/推理前向下算出的 draft loss 没有 grad_fn，一旦被 stash，随后
-        # eagle3_backward_step 调 backward() 会报 "element 0 does not require grad"。
-        logger.warning("[DRAFT-TRAIN-SERIAL] model not in training mode, skipping draft training")
-        return logits
-
-    if loss_mask is None:
-        # 串行 Draft 步没有 loss_mask 就无法算 loss，本步注定空转。
-        # 与并行路径的四重门禁保持一致（并行也要求 loss_mask is not None）。
-        logger.warning("[DRAFT-TRAIN-SERIAL] loss_mask is None, skipping draft training")
-        return logits
-
-    try:
-        # 3-7. draft 前向 + loss 计算 + 暂存
-        # 与并行路径共用 _eagle3_draft_forward_and_stash_loss，唯一真源。
-        # 之前这里是手抄的一份，抄写中丢了 SP gather、抄错了 compute_draft_loss 的
-        # 参数名（draft_logits → student_logits_per_step）和 ttt_length 默认值
-        # （None → 1）、抄漏了 loss_mask 的维度判断，连续崩了三次。
-        # 现在只保留串行特有的异常策略（抛出而非吞掉）。
-        loss_out = _eagle3_draft_forward_and_stash_loss(
-            self,
-            hidden_states=hidden_states,
-            input_ids=input_ids,
-            position_ids=position_ids,
-            loss_mask=loss_mask,
-            output_weight=output_weight,
-            logits=logits,
-        )
-
-        logger.info(
-            f"[DRAFT-TRAIN-SERIAL] Draft loss={loss_out['loss'].item():.4f}, "
-            f"num_tokens={loss_out['num_tokens'].item()}"
-        )
-
-    except _OOM_ERRORS:
-        # 串行 Draft 步与并行路径不同：这一步的**唯一目的**就是训练 draft。
-        # 吞掉异常会让整步变成空转，却仍然上报"训练成功"——比直接崩溃更糟，
-        # 因为它会安静地烧掉整轮训练时间（2026-08-26 就是这么浪费掉的）。
-        # 所以先清显存，再原样抛出，让上层看到真实失败。
-        logger.error(
-            "[DRAFT-TRAIN-SERIAL] Draft 训练步 OOM —— 本步没有任何 draft 参数被更新。"
-            "已抛出而非静默跳过（静默跳过会让整步空转且伪装成成功）。"
-            "请调小 draft 的 ppo_micro_batch_size_per_gpu 后重跑。",
-            exc_info=True,
-        )
-        _eagle3_empty_cache()
-        raise
-    except Exception:
-        logger.error(
-            "[DRAFT-TRAIN-SERIAL] Draft 训练步失败（非 OOM）—— 本步没有任何 draft 参数被更新，已抛出。",
-            exc_info=True,
-        )
-        raise
-    finally:
-        # 清理 capture
-        if capture is not None:
-            capture.clear()
-
-    return logits  # 返回 policy logits（draft 步不会被用于 policy loss）
+# [P3-DEAD v1/v2 20260829] v1/v2 独立 Draft 步的模型侧实现，v3 已由 _eagle3_collect_features_step
+# + deferred_training 取代，无调用点。整体验证通过后删除。
+# def _eagle3_draft_training_step(
+#     self,
+#     hidden_states,
+#     input_ids,
+#     position_ids,
+#     labels,
+#     rotary_pos_emb,
+#     rotary_pos_cos,
+#     rotary_pos_sin,
+#     mtp_in_postprocess,
+#     loss_mask,
+#     decoder_input,
+#     attention_mask,
+#     padding_mask,
+#     inference_params,
+#     packed_seq_params,
+#     sequence_len_offset,
+#     runtime_gather_output,
+#     extra_block_kwargs,
+#     inference_context,
+#     output_processor,
+#     output_processor_context,
+#     is_spec_decode,
+# ):
+#     """串行模式 - Draft 训练步：只训练 draft，Actor 冻结（新增方法）
+#
+#     执行流程：
+#     1. Actor forward（冻结参数，生成 teacher logits）
+#     2. Draft forward + loss 计算
+#     3. Draft backward + 参数更新
+#
+#     与并行模式的区别：
+#     - Actor 参数冻结，只做前向传播生成 teacher
+#     - 只有 Draft 参与梯度计算和参数更新
+#     """
+#     output_weight = None
+#     if self.share_embeddings_and_output_weights:
+#         output_weight = self.shared_embedding_or_output_weight()
+#
+#     if not self.post_process:
+#         return hidden_states
+#
+#     # 1. 计算 policy logits（Actor 前向，用作 teacher）
+#     logits, _ = self.output_layer(hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
+#     logits = logits.transpose(0, 1).contiguous()  # [s b v] -> [b s v]
+#
+#     # 2. Draft 训练流程
+#     draft_list = getattr(self, "_eagle3_draft", None)
+#     capture = getattr(self, "_eagle3_capture", None)
+#
+#     # _eagle3_draft 是单元素列表 [draft_module]，需要解包
+#     if draft_list is None or not draft_list or capture is None:
+#         logger.warning("[DRAFT-TRAIN-SERIAL] Draft or capture not available, skipping draft training")
+#         return logits
+#
+#     if not self.training:
+#         # 与并行路径的四重门禁对齐（并行见 _eagle3_parallel_training 的 gate）。
+#         # eval/推理前向下算出的 draft loss 没有 grad_fn，一旦被 stash，随后
+#         # eagle3_backward_step 调 backward() 会报 "element 0 does not require grad"。
+#         logger.warning("[DRAFT-TRAIN-SERIAL] model not in training mode, skipping draft training")
+#         return logits
+#
+#     if loss_mask is None:
+#         # 串行 Draft 步没有 loss_mask 就无法算 loss，本步注定空转。
+#         # 与并行路径的四重门禁保持一致（并行也要求 loss_mask is not None）。
+#         logger.warning("[DRAFT-TRAIN-SERIAL] loss_mask is None, skipping draft training")
+#         return logits
+#
+#     try:
+#         # 3-7. draft 前向 + loss 计算 + 暂存
+#         # 与并行路径共用 _eagle3_draft_forward_and_stash_loss，唯一真源。
+#         # 之前这里是手抄的一份，抄写中丢了 SP gather、抄错了 compute_draft_loss 的
+#         # 参数名（draft_logits → student_logits_per_step）和 ttt_length 默认值
+#         # （None → 1）、抄漏了 loss_mask 的维度判断，连续崩了三次。
+#         # 现在只保留串行特有的异常策略（抛出而非吞掉）。
+#         loss_out = _eagle3_draft_forward_and_stash_loss(
+#             self,
+#             hidden_states=hidden_states,
+#             input_ids=input_ids,
+#             position_ids=position_ids,
+#             loss_mask=loss_mask,
+#             output_weight=output_weight,
+#             logits=logits,
+#         )
+#
+#         logger.info(
+#             f"[DRAFT-TRAIN-SERIAL] Draft loss={loss_out['loss'].item():.4f}, "
+#             f"num_tokens={loss_out['num_tokens'].item()}"
+#         )
+#
+#     except _OOM_ERRORS:
+#         # 串行 Draft 步与并行路径不同：这一步的**唯一目的**就是训练 draft。
+#         # 吞掉异常会让整步变成空转，却仍然上报"训练成功"——比直接崩溃更糟，
+#         # 因为它会安静地烧掉整轮训练时间（2026-08-26 就是这么浪费掉的）。
+#         # 所以先清显存，再原样抛出，让上层看到真实失败。
+#         logger.error(
+#             "[DRAFT-TRAIN-SERIAL] Draft 训练步 OOM —— 本步没有任何 draft 参数被更新。"
+#             "已抛出而非静默跳过（静默跳过会让整步空转且伪装成成功）。"
+#             "请调小 draft 的 ppo_micro_batch_size_per_gpu 后重跑。",
+#             exc_info=True,
+#         )
+#         _eagle3_empty_cache()
+#         raise
+#     except Exception:
+#         logger.error(
+#             "[DRAFT-TRAIN-SERIAL] Draft 训练步失败（非 OOM）—— 本步没有任何 draft 参数被更新，已抛出。",
+#             exc_info=True,
+#         )
+#         raise
+#     finally:
+#         # 清理 capture
+#         if capture is not None:
+#             capture.clear()
+#
+#     return logits  # 返回 policy logits（draft 步不会被用于 policy loss）
 
 

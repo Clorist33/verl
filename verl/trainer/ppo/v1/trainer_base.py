@@ -886,9 +886,9 @@ class PPOTrainer(ABC):
     def _update_draft_deferred(self, batch: KVBatchMeta, metrics: dict) -> None:
         """v3：用本步采集的特征训练 draft（在 update_actor 之后调用）。
 
-        与 :meth:`_update_draft` 的区别：后者是 v1/v2 的独立 Draft 步入口，会触发一次
-        完整的 policy 前向来产 teacher；本方法不跑任何 policy 前向，teacher 由冻结的
-        lm_head 副本从已采集的 hidden 重建。
+        与已停用的 ``_update_draft``（v1/v2 独立 Draft 步入口，见下方 P3-DEAD 注释块）的
+        区别：后者会触发一次完整的 policy 前向来产 teacher；本方法不跑任何 policy 前向，
+        teacher 由冻结的 lm_head 副本从已采集的 hidden 重建。
         """
         output = self.actor_rollout_wg.update_draft_deferred(batch)
         if output is None:
@@ -907,22 +907,24 @@ class PPOTrainer(ABC):
         # 会把它静默丢弃，TensorBoard 的 add_scalar 则会抛异常。
         metrics.update(reduce_metrics(rename_dict(output["metrics"], "draft/")))
 
-    def _update_draft(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """Draft 训练步骤（新增方法）：
-        1. Actor forward（冻结）生成 teacher logits + hidden states
-        2. Draft forward + loss 计算
-        3. Draft backward + 参数更新
-        """
-        output: TensorDict = self.actor_rollout_wg.update_draft(batch)
-
-        # 提取 draft metrics
-        if output is not None:
-            from verl.utils.py_functional import rename_dict
-
-            draft_metrics = rename_dict(output["metrics"], "draft/")
-            metrics.update(draft_metrics)
-
-        return batch
+    # [P3-DEAD v1/v2 20260829] v1/v2 独立 Draft 步的驱动入口，v3 走 _update_draft_deferred，无调用点。
+    # 整体验证通过后删除。
+#     def _update_draft(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+#         """Draft 训练步骤（新增方法）：
+#         1. Actor forward（冻结）生成 teacher logits + hidden states
+#         2. Draft forward + loss 计算
+#         3. Draft backward + 参数更新
+#         """
+#         output: TensorDict = self.actor_rollout_wg.update_draft(batch)
+#
+#         # 提取 draft metrics
+#         if output is not None:
+#             from verl.utils.py_functional import rename_dict
+#
+#             draft_metrics = rename_dict(output["metrics"], "draft/")
+#             metrics.update(draft_metrics)
+#
+#         return batch
 
     # ------------------------------ abstract methods ------------------------------
 

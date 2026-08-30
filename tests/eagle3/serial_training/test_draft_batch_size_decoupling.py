@@ -7,6 +7,16 @@
 3. 配置应用逻辑
 """
 
+import pytest
+
+# [P3-DEAD v1/v2 20260829] 本文件是 v1/v2（独立 Draft 步）时期的测试：断言 update_draft / _apply_draft_batch_config 存在。
+# 这些接口在 v3（搭车采集 + 延后训练）下已不可达，源码已整体注释待删，
+# 因此本文件一并冻结。整体验证通过、死代码正式删除时，本文件同批删除。
+pytest.skip(
+    "v1/v2 serial-training tests frozen: the APIs under test are commented out (P3-DEAD)",
+    allow_module_level=True,
+)
+
 import sys
 from unittest.mock import MagicMock, patch
 
