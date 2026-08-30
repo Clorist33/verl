@@ -58,6 +58,27 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _eagle3_scalar_global_step(data) -> int:
+    """Read ``global_steps`` off a batch as a plain int.
+
+    ``global_steps`` is assigned per-sample during rollout
+    (``trainer_base._generate_sequences``), so a batched TensorDict hands it back
+    as a ``NonTensorStack`` -- one copy per row -- not a scalar. Both ``or`` and
+    ``int()`` raise on that type (``RuntimeError: Converting a tensordict to
+    boolean value is not permitted`` / ``TypeError``), which is what took down
+    the first draft-training step of a run. Unwrap the stack and take the first
+    entry: every row of a step carries the same step number.
+    """
+    value = tu.get_non_tensor_data(data, "global_steps", default=0)
+    if hasattr(value, "tolist"):  # NonTensorStack, np.ndarray, torch.Tensor
+        value = value.tolist()
+    while isinstance(value, (list, tuple)):
+        if not value:
+            return 0
+        value = value[0]
+    return int(value) if value is not None else 0
+
+
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
@@ -337,21 +358,21 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def train_batch(self, data: TensorDict) -> TensorDict:
         """训练一个 batch（路由入口）
 
-        【路由方法】根据 train_draft_only 标志决定调用哪个训练逻辑。
-        本方法不包含任何业务逻辑，只做路由判断。
-
-        原有逻辑封装在 _train_batch_original 中（完全不变）。
-        新增逻辑封装在 _train_batch_draft_only 中（独立方法）。
+        v3 下只剩一条路径：原有逻辑 _train_batch_original（并行模式或串行的 actor 步）。
+        v1/v2 的 train_draft_only 分支已停用——驱动侧 trainer_base.py:817 恒设该标志为
+        False，draft 训练改由 update_draft_deferred 在 update_actor 之后单独驱动。
         """
-        # 提取标志
-        train_draft_only = tu.get_non_tensor_data(data, "train_draft_only", default=False)
-
-        if train_draft_only:
-            # 串行模式：Draft 训练步（新增逻辑）
-            return self._train_batch_draft_only(data)
-        else:
-            # 原有逻辑（并行模式或串行的 actor 步）
-            return self._train_batch_original(data)
+        # [P3-DEAD v1/v2 20260829] train_draft_only 分支不可达，函数本体已注释。
+        # 整体验证通过后连同 _train_batch_draft_only 一并删除。
+        # train_draft_only = tu.get_non_tensor_data(data, "train_draft_only", default=False)
+        #
+        # if train_draft_only:
+        #     # 串行模式：Draft 训练步（新增逻辑）
+        #     return self._train_batch_draft_only(data)
+        # else:
+        #     # 原有逻辑（并行模式或串行的 actor 步）
+        #     return self._train_batch_original(data)
+        return self._train_batch_original(data)
 
     def _train_batch_original(self, data: TensorDict) -> TensorDict:
         """原有的 train_batch 逻辑（完全不改动，只是重命名）
@@ -414,112 +435,114 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         return final_output
 
-    def _train_batch_draft_only(self, data: TensorDict) -> TensorDict:
-        """串行模式的 Draft 训练（新增方法）
-
-        【新增逻辑】专门用于 draft 训练步，与原有逻辑完全独立。
-
-        执行流程：
-        1. Actor forward（冻结参数，生成 teacher）
-        2. Draft forward + loss 计算
-        3. Draft backward + 参数更新
-        """
-        assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
-        assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
-
-        # 获取必要参数
-        global_token_num = tu.get(data, key="global_token_num")
-        disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
-        images_seqlens = tu.get(data, key="images_seqlens", default=None)
-
-        # 注入工程参数
-        default_keys = dict(
-            use_remove_padding=self.model_config.get("use_remove_padding", False),
-            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
-            max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
-            micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
-            use_fused_kernels=self.engine_config.use_fused_kernels,
-        )
-
-        for key, val in default_keys.items():
-            if key not in data.keys():
-                tu.assign_non_tensor(data, **{key: val})
-
-        # 设置标志（传递给 engine）
-        tu.assign_non_tensor_data(data, "train_draft_only", True)
-        tu.assign_non_tensor_data(data, "enable_draft_training", True)
-
-        # 训练流程
-        #
-        # 【为什么不直接调 engine.train_batch】
-        # engine/base.py 的 train_batch 是 zero_grad -> forward_backward(forward_only=False)
-        # -> optimizer_step() 三件套，对串行 Draft 步有两处不适用：
-        #
-        #   1) optimizer_step() 是 **policy** 的 optimizer，没有任何 train_draft_only 守卫。
-        #      串行 Draft 步的语义是"policy 只做 forward 产 teacher，不更新"，直接调
-        #      train_batch 会把 policy 一起用 GRPO 更新掉，与串行设计相悖。
-        #   2) forward_only=False 会让 megatron 对 loss_function 的返回值做 backward，
-        #      而 loss_fn 是 ppo_loss，它需要 old_log_probs / advantages
-        #      （losses.py: data.select("response_mask", "old_log_probs", "advantages")）。
-        #      串行 Draft 分支只跑了 reward + _balance_batch，从没调过 _compute_old_log_prob
-        #      和 _compute_advantage，这两个字段根本不存在 -> KeyError。
-        #
-        # 所以这里改用 forward_only=True 手工展开：
-        #   - loss_function=None + forward_only=True -> postprocess 走常量 loss 分支，
-        #     ppo_loss 永不被调用，问题 2 消失；
-        #   - megatron 在 forward_only 下只是跳过 backward_step，**不加 no_grad**
-        #     （schedules.py:634-652 已确认），所以 draft 的计算图完好存活；
-        #   - policy 全程不 backward，问题 1 消失，且省掉一整个反向的算力/显存；
-        #   - draft 的 backward + draft_optimizer.step() 由 eagle3_backward_step 负责，
-        #     它在 forward_backward_batch 内部执行（该处守卫已放宽为
-        #     `not forward_only or train_draft_only`，以接纳本路径）。串行与并行共用
-        #     同一个调用点和同一套 metrics 包装，本方法不再手工补调。
-        with (
-            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
-            Timer(name="train_batch_draft", logger=None) as timer,
-        ):
-            maybe_fix_3d_position_ids(data)
-            # draft 的 backward + draft_optimizer.step()，以及 draft_loss 写入 metrics，
-            # 均由 forward_backward_batch 内部的 eagle3_backward_step 完成
-            # （transformer_impl.py:892，该处守卫已放宽以接纳 forward_only=True 的串行 Draft 步）。
-            # 注入点在 :936 postprocess_batch_func 之前，metrics 由 append_to_dict 统一包成
-            # list —— 与并行完全同一条路径，串行不再自持形状责任。
-            #
-            # 【不要在这里手工补调 eagle3_backward_step】那样注入点会落到
-            # postprocess_batch_func 之后，跳过 append_to_dict 的包装，裸 float 进
-            # allgather_dict_into_dict 后会被 train_mini_batch:326 的 chain.from_iterable
-            # 炸掉（'float' object is not iterable）。2026-08-28 已经这么错过一次，详见 优化16。
-            output = self.engine.forward_backward_batch(data, loss_function=None, forward_only=True)
-
-        delta_time = timer.last
-
-        # 处理输出
-        if self.engine.is_mp_src_rank_with_outputs():
-            output.pop("model_output", None)
-
-            # 【守卫】串行 Draft 步的唯一目的就是训 draft。eagle3_backward_step() 在
-            # 取不到暂存 loss 时会 return None 并静默跳过 backward/step，本步就会整步
-            # 空转却上报"成功"，安静烧掉一轮训练时间（2026-08-26 就这么浪费过一轮）。
-            # 这里显式检查 draft_loss 是否真的产生，没有就直接失败，不允许静默。
-            if "draft_loss" not in output.get("metrics", {}):
-                raise RuntimeError(
-                    "[DRAFT-TRAIN-SERIAL] Draft 训练步没有产生 draft_loss：本步 draft 未做 "
-                    "backward/optimizer.step()，属于整步空转。请检查 eagle3_patch 的 draft "
-                    "前向是否被跳过（如 loss_mask is None），或 _eagle3_draft_losses 是否被 "
-                    "其他代码提前 drain。"
-                )
-
-            final_output = self._postprocess_output(
-                output,
-                global_token_num=global_token_num,
-                delta_time=delta_time,
-                forward_only=False,
-                images_seqlens=images_seqlens,
-            ).cpu()
-        else:
-            final_output = None
-
-        return final_output
+    # [P3-DEAD v1/v2 20260829] v1/v2 独立 Draft 步的 worker 侧实现。train_batch 的 train_draft_only
+    # 分支已停用，无调用点。整体验证通过后删除。
+#     def _train_batch_draft_only(self, data: TensorDict) -> TensorDict:
+#         """串行模式的 Draft 训练（新增方法）
+#
+#         【新增逻辑】专门用于 draft 训练步，与原有逻辑完全独立。
+#
+#         执行流程：
+#         1. Actor forward（冻结参数，生成 teacher）
+#         2. Draft forward + loss 计算
+#         3. Draft backward + 参数更新
+#         """
+#         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
+#         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
+#
+#         # 获取必要参数
+#         global_token_num = tu.get(data, key="global_token_num")
+#         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
+#         images_seqlens = tu.get(data, key="images_seqlens", default=None)
+#
+#         # 注入工程参数
+#         default_keys = dict(
+#             use_remove_padding=self.model_config.get("use_remove_padding", False),
+#             use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+#             max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
+#             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
+#             use_fused_kernels=self.engine_config.use_fused_kernels,
+#         )
+#
+#         for key, val in default_keys.items():
+#             if key not in data.keys():
+#                 tu.assign_non_tensor(data, **{key: val})
+#
+#         # 设置标志（传递给 engine）
+#         tu.assign_non_tensor_data(data, "train_draft_only", True)
+#         tu.assign_non_tensor_data(data, "enable_draft_training", True)
+#
+#         # 训练流程
+#         #
+#         # 【为什么不直接调 engine.train_batch】
+#         # engine/base.py 的 train_batch 是 zero_grad -> forward_backward(forward_only=False)
+#         # -> optimizer_step() 三件套，对串行 Draft 步有两处不适用：
+#         #
+#         #   1) optimizer_step() 是 **policy** 的 optimizer，没有任何 train_draft_only 守卫。
+#         #      串行 Draft 步的语义是"policy 只做 forward 产 teacher，不更新"，直接调
+#         #      train_batch 会把 policy 一起用 GRPO 更新掉，与串行设计相悖。
+#         #   2) forward_only=False 会让 megatron 对 loss_function 的返回值做 backward，
+#         #      而 loss_fn 是 ppo_loss，它需要 old_log_probs / advantages
+#         #      （losses.py: data.select("response_mask", "old_log_probs", "advantages")）。
+#         #      串行 Draft 分支只跑了 reward + _balance_batch，从没调过 _compute_old_log_prob
+#         #      和 _compute_advantage，这两个字段根本不存在 -> KeyError。
+#         #
+#         # 所以这里改用 forward_only=True 手工展开：
+#         #   - loss_function=None + forward_only=True -> postprocess 走常量 loss 分支，
+#         #     ppo_loss 永不被调用，问题 2 消失；
+#         #   - megatron 在 forward_only 下只是跳过 backward_step，**不加 no_grad**
+#         #     （schedules.py:634-652 已确认），所以 draft 的计算图完好存活；
+#         #   - policy 全程不 backward，问题 1 消失，且省掉一整个反向的算力/显存；
+#         #   - draft 的 backward + draft_optimizer.step() 由 eagle3_backward_step 负责，
+#         #     它在 forward_backward_batch 内部执行（该处守卫已放宽为
+#         #     `not forward_only or train_draft_only`，以接纳本路径）。串行与并行共用
+#         #     同一个调用点和同一套 metrics 包装，本方法不再手工补调。
+#         with (
+#             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+#             Timer(name="train_batch_draft", logger=None) as timer,
+#         ):
+#             maybe_fix_3d_position_ids(data)
+#             # draft 的 backward + draft_optimizer.step()，以及 draft_loss 写入 metrics，
+#             # 均由 forward_backward_batch 内部的 eagle3_backward_step 完成
+#             # （transformer_impl.py:892，该处守卫已放宽以接纳 forward_only=True 的串行 Draft 步）。
+#             # 注入点在 :936 postprocess_batch_func 之前，metrics 由 append_to_dict 统一包成
+#             # list —— 与并行完全同一条路径，串行不再自持形状责任。
+#             #
+#             # 【不要在这里手工补调 eagle3_backward_step】那样注入点会落到
+#             # postprocess_batch_func 之后，跳过 append_to_dict 的包装，裸 float 进
+#             # allgather_dict_into_dict 后会被 train_mini_batch:326 的 chain.from_iterable
+#             # 炸掉（'float' object is not iterable）。2026-08-28 已经这么错过一次，详见 优化16。
+#             output = self.engine.forward_backward_batch(data, loss_function=None, forward_only=True)
+#
+#         delta_time = timer.last
+#
+#         # 处理输出
+#         if self.engine.is_mp_src_rank_with_outputs():
+#             output.pop("model_output", None)
+#
+#             # 【守卫】串行 Draft 步的唯一目的就是训 draft。eagle3_backward_step() 在
+#             # 取不到暂存 loss 时会 return None 并静默跳过 backward/step，本步就会整步
+#             # 空转却上报"成功"，安静烧掉一轮训练时间（2026-08-26 就这么浪费过一轮）。
+#             # 这里显式检查 draft_loss 是否真的产生，没有就直接失败，不允许静默。
+#             if "draft_loss" not in output.get("metrics", {}):
+#                 raise RuntimeError(
+#                     "[DRAFT-TRAIN-SERIAL] Draft 训练步没有产生 draft_loss：本步 draft 未做 "
+#                     "backward/optimizer.step()，属于整步空转。请检查 eagle3_patch 的 draft "
+#                     "前向是否被跳过（如 loss_mask is None），或 _eagle3_draft_losses 是否被 "
+#                     "其他代码提前 drain。"
+#                 )
+#
+#             final_output = self._postprocess_output(
+#                 output,
+#                 global_token_num=global_token_num,
+#                 delta_time=delta_time,
+#                 forward_only=False,
+#                 images_seqlens=images_seqlens,
+#             ).cpu()
+#         else:
+#             final_output = None
+#
+#         return final_output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
     def infer_batch(self, data: TensorDict) -> TensorDict:
@@ -720,7 +743,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
 
-            # === 串行训练：存到 self 供 _apply_draft_batch_config 使用 ===
+            # === 串行训练：存到 self 供 v3 的 draft 采集/训练配置读取（见 _eagle3_collect_config、
+            #     update_draft_deferred）。原注释说的 _apply_draft_batch_config 已是 v1/v2 死代码。===
             self.actor_config = actor_config
 
             distillation_config: Optional[DistillationConfig] = (
@@ -856,7 +880,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         from verl.models.eagle3.feature_store import DraftFeatureStore
 
-        global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
+        global_step = _eagle3_scalar_global_step(data)
         if state.feature_store is None:
             state.feature_store = DraftFeatureStore()
         # begin_step drops anything a previous step left behind and warns if it
@@ -918,7 +942,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if state is None or not state.enabled or state.feature_store is None:
             return None
 
-        global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
+        global_step = _eagle3_scalar_global_step(data)
         micro_bsz = getattr(self.actor_config, "draft_ppo_micro_batch_size_per_gpu", None)
         steps_per_trigger = int(getattr(self.actor_config, "draft_steps_per_trigger", None) or 10)
         train_bsz = getattr(self.actor_config, "draft_train_batch_size_per_gpu", None)
@@ -977,8 +1001,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         state = getattr(engine, "_eagle3", None)
         if state is None or not state.enabled:
             return None
-        global_step = int(tu.get_non_tensor_data(data, "global_steps", default=0) or 0)
-        refresh_frozen_teacher_head(engine, global_step=global_step)
+        global_step = _eagle3_scalar_global_step(data)
+        # 必须在 engine 的 mode 上下文内跑。param_offload=True 时，policy 参数只在
+        # train_mode/eval_mode 内被搬到设备上（BaseEngineCtx._context_switch），
+        # 上下文之外 output_layer.weight 是 CPU 张量；而 refresh_frozen_teacher_head
+        # 要对它做 TP all_gather，拿 CPU 张量进 HCCL 会直接失败——真机表现为
+        # frozen_teacher.py 的 HcclAllgather RuntimeError（异步算子，报错点还会被延后
+        # 到下一行的索引，很难从栈上看出真因）。TP=1 时不做 all_gather，所以只有
+        # TP>1 才暴露，单元测试也照不到。
+        #
+        # 用 eval_mode 而不是 train_mode：这里只**读** lm_head，不训练。eval 路径
+        # 只 load 模型参数（load_grad=False），跳过优化器状态——对 8B 模型来说
+        # Adam state 是权重的两倍，白搬一趟。也不会像 train_mode 那样在退出时
+        # zero_grad。
+        with self.engine.eval_mode():
+            refresh_frozen_teacher_head(engine, global_step=global_step)
         return None
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -988,72 +1025,74 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="orange", role="draft_update")
-    @_with_routing_replay_flag(enabled=True)
-    def update_draft(self, data: TensorDict) -> TensorDict:
-        """Draft 专属训练入口（新增方法）
-
-        与 update_actor 并列，专门用于 draft 训练步。
-        本方法是新增的，不修改任何原有方法。
-
-        Args:
-            data: 包含训练数据的 TensorDict
-
-        Returns:
-            训练结果（metrics 等）
-        """
-        # === 新增：应用 Draft 专用的 batch size 配置 ===
-        data = self._apply_draft_batch_config(data)
-
-        # 设置标志：告诉 engine 这是 draft 训练模式
-        tu.assign_non_tensor_data(data, "train_draft_only", True)
-        tu.assign_non_tensor_data(data, "enable_draft_training", True)
-
-        # 调用 actor 的 train_mini_batch（内部会根据标志走 draft 路径）
-        output = self.actor.train_mini_batch(data=data)
-        return output.cpu() if output is not None else None
-
-    def _apply_draft_batch_config(self, data: TensorDict) -> TensorDict:
-        """应用 Draft 专用的 batch size 配置
-
-        从配置中读取 draft_ppo_* 参数，如果存在则覆盖 data 中的对应参数。
-        如果 draft_ppo_* 参数为 None，则使用 Actor 的参数（fallback 机制）。
-
-        注意：train_mini_batch() 期望的参数名是 mini_batch_size / num_mini_batch，
-        不是 ppo_mini_batch_size。
-
-        Args:
-            data: 输入的 TensorDict
-
-        Returns:
-            应用 Draft 配置后的 TensorDict
-        """
-        config = self.actor_config  # ActorConfig 对象
-
-        # 读取 Draft 专用配置（如果存在）
-        draft_mini_bsz = getattr(config, 'draft_ppo_mini_batch_size', None)
-        draft_micro_bsz = getattr(config, 'draft_ppo_micro_batch_size', None)
-        draft_micro_bsz_per_gpu = getattr(config, 'draft_ppo_micro_batch_size_per_gpu', None)
-        draft_infer_micro_bsz_per_gpu = getattr(config, 'draft_ppo_infer_micro_batch_size_per_gpu', None)
-
-        # 应用 Draft 配置（如果设置了的话）
-        # train_mini_batch() 从 data 中读取 "mini_batch_size" 或 "num_mini_batch"
-        if draft_mini_bsz is not None:
-            tu.assign_non_tensor_data(data, "mini_batch_size", draft_mini_bsz)
-            logger.info(f"[Draft Config] Using draft_ppo_mini_batch_size={draft_mini_bsz}")
-
-        # train_mini_batch() 没有直接读取 ppo_micro_batch_size，但可能在其他地方需要
-        # 为了兼容性，两个都设置
-        if draft_micro_bsz_per_gpu is not None:
-            tu.assign_non_tensor_data(data, "ppo_micro_batch_size_per_gpu", draft_micro_bsz_per_gpu)
-            logger.info(f"[Draft Config] Using draft_ppo_micro_batch_size_per_gpu={draft_micro_bsz_per_gpu}")
-
-        if draft_infer_micro_bsz_per_gpu is not None:
-            tu.assign_non_tensor_data(data, "ppo_infer_micro_batch_size_per_gpu", draft_infer_micro_bsz_per_gpu)
-            logger.info(f"[Draft Config] Using draft_ppo_infer_micro_batch_size_per_gpu={draft_infer_micro_bsz_per_gpu}")
-
-        return data
+    # [P3-DEAD v1/v2 20260829] update_draft / _apply_draft_batch_config：v1/v2 独立 Draft 步入口，
+    # 唯一调用者 trainer_base._update_draft 已一并停用。整体验证通过后删除。
+#     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+#     @DistProfiler.annotate(color="orange", role="draft_update")
+#     @_with_routing_replay_flag(enabled=True)
+#     def update_draft(self, data: TensorDict) -> TensorDict:
+#         """Draft 专属训练入口（新增方法）
+#
+#         与 update_actor 并列，专门用于 draft 训练步。
+#         本方法是新增的，不修改任何原有方法。
+#
+#         Args:
+#             data: 包含训练数据的 TensorDict
+#
+#         Returns:
+#             训练结果（metrics 等）
+#         """
+#         # === 新增：应用 Draft 专用的 batch size 配置 ===
+#         data = self._apply_draft_batch_config(data)
+#
+#         # 设置标志：告诉 engine 这是 draft 训练模式
+#         tu.assign_non_tensor_data(data, "train_draft_only", True)
+#         tu.assign_non_tensor_data(data, "enable_draft_training", True)
+#
+#         # 调用 actor 的 train_mini_batch（内部会根据标志走 draft 路径）
+#         output = self.actor.train_mini_batch(data=data)
+#         return output.cpu() if output is not None else None
+#
+#     def _apply_draft_batch_config(self, data: TensorDict) -> TensorDict:
+#         """应用 Draft 专用的 batch size 配置
+#
+#         从配置中读取 draft_ppo_* 参数，如果存在则覆盖 data 中的对应参数。
+#         如果 draft_ppo_* 参数为 None，则使用 Actor 的参数（fallback 机制）。
+#
+#         注意：train_mini_batch() 期望的参数名是 mini_batch_size / num_mini_batch，
+#         不是 ppo_mini_batch_size。
+#
+#         Args:
+#             data: 输入的 TensorDict
+#
+#         Returns:
+#             应用 Draft 配置后的 TensorDict
+#         """
+#         config = self.actor_config  # ActorConfig 对象
+#
+#         # 读取 Draft 专用配置（如果存在）
+#         draft_mini_bsz = getattr(config, 'draft_ppo_mini_batch_size', None)
+#         draft_micro_bsz = getattr(config, 'draft_ppo_micro_batch_size', None)
+#         draft_micro_bsz_per_gpu = getattr(config, 'draft_ppo_micro_batch_size_per_gpu', None)
+#         draft_infer_micro_bsz_per_gpu = getattr(config, 'draft_ppo_infer_micro_batch_size_per_gpu', None)
+#
+#         # 应用 Draft 配置（如果设置了的话）
+#         # train_mini_batch() 从 data 中读取 "mini_batch_size" 或 "num_mini_batch"
+#         if draft_mini_bsz is not None:
+#             tu.assign_non_tensor_data(data, "mini_batch_size", draft_mini_bsz)
+#             logger.info(f"[Draft Config] Using draft_ppo_mini_batch_size={draft_mini_bsz}")
+#
+#         # train_mini_batch() 没有直接读取 ppo_micro_batch_size，但可能在其他地方需要
+#         # 为了兼容性，两个都设置
+#         if draft_micro_bsz_per_gpu is not None:
+#             tu.assign_non_tensor_data(data, "ppo_micro_batch_size_per_gpu", draft_micro_bsz_per_gpu)
+#             logger.info(f"[Draft Config] Using draft_ppo_micro_batch_size_per_gpu={draft_micro_bsz_per_gpu}")
+#
+#         if draft_infer_micro_bsz_per_gpu is not None:
+#             tu.assign_non_tensor_data(data, "ppo_infer_micro_batch_size_per_gpu", draft_infer_micro_bsz_per_gpu)
+#             logger.info(f"[Draft Config] Using draft_ppo_infer_micro_batch_size_per_gpu={draft_infer_micro_bsz_per_gpu}")
+#
+#         return data
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
