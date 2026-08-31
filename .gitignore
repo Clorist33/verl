@@ -136,3 +136,8 @@ vllm.shadowed_checkout_bak/
 examples/eagle3/extra-info/
 *.o
 *.bak*
+
+# EAGLE3 训练输出目录：都曾被误提交过，历史已清理
+# （tensorboard_log 下的 tfevents 于 20260831 用 filter-branch 从本分支剥离）
+verl_eagle3/
+tensorboard_log/
