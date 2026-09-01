@@ -154,13 +154,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         self.model_config.model_type = self.config.model_type
         self.engine: BaseEngine = EngineRegistry.new(
-            model_type=self.config.model_type,             # 传入参数是"language_model"
-            backend=self.engine_config.strategy,           # 传入参数是megatron
+            model_type=self.config.model_type,             # eagle3传入参数是"language_model"
+            backend=self.engine_config.strategy,           # eagle3传入参数是megatron
             model_config=self.model_config,
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
             checkpoint_config=self.checkpoint_config,
-        )
+        )     # 在eagle3的训练里，self.engine是MegatronEngineWithLMHead的一个实例
 
         # build dispatch info
         self._register_dispatch_collect_info(
@@ -196,7 +196,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Reset the model engine to the initial state. If the engine is not initialized,
         we initialize it. Otherwise, reload ckpt and reset states
         """
-        self.engine.initialize()         # engine初始化，会跳到transformer_impl.py的MegatronEngine.initialize()
+        self.engine.initialize()         # engine初始化，在eagle3的训练里，self.engine是MegatronEngineWithLMHead的一个实例。会跳到transformer_impl.py的MegatronEngine.initialize()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """

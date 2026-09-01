@@ -297,7 +297,7 @@ class PPOTrainer(ABC):
                 resource_pool=resource_pool,
                 ray_cls_with_init=worker_dict_cls,
                 **wg_kwargs,
-            )
+            )                # 创建 16 个 ActorRolloutRefWorker 实例，每个 worker 在创建时跑 __init__，但 __init__ 只建 engine 对象，不初始化
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
             logger.info(f"create worker group {spawn_wg.keys()}")
@@ -312,7 +312,17 @@ class PPOTrainer(ABC):
 
         # 6. initialize actor and ref model engine
         self.actor_rollout_wg = all_wg[str(actor_role)]
-        self.actor_rollout_wg.init_model()
+        self.actor_rollout_wg.init_model()                  # Driver 进程 往 16 个 worker 进程发消息。RPC 调所有 worker 的 init_model，会跳到verl/workers/engine_workers.py 的 init_model()
+                                                            # Driver 进程（主进程），self.actor_rollout_wg.init_model()这句指令在主进程
+                                                            # │  通过 Ray 框架，发送 "请执行 init_model()" 消息
+                                                            # ├──► Worker 0 进程（GPU 0）
+                                                            # ├──► Worker 1 进程（GPU 1）
+                                                            # ├──► ...
+                                                            # └──► Worker 15 进程（GPU 15）
+                                                            #  RPC = Remote Procedure Call（远程过程调用）简单说：在进程 A 里调用一个函数，但这个函数真正在进程 B 里执行。
+                                                            # actor_rollout_wg 是一个 RayWorkerGroup，它代表 16 个 worker 的集合。调它的方法 = RPC 到所有 worker。
+        
+
         logger.info("actor and ref model engine initialized")
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
@@ -651,18 +661,18 @@ class PPOTrainer(ABC):
         # self.global_steps 已在父类初始化
 
         # 5. 日志输出
-        period = k + 1
-        num_cycles = total_training_steps // period
-        logger.info("=" * 60)
-        logger.info("[Serial Training] Initialized scheduler:")
-        logger.info(f"  actor_training_steps:       {self.actor_training_steps}")
-        logger.info(f"  actor_steps_per_draft_step: {k}")
-        logger.info(f"  draft_training_steps:       {self.draft_training_steps}")
-        logger.info(f"  total_training_steps:       {self.total_training_steps}")
-        logger.info(f"  training_ratio:             Actor:{self.actor_training_steps} / Draft:{self.draft_training_steps} = {k}:1")
-        logger.info(f"  period (k+1):               {period} steps/cycle")
-        logger.info(f"  num_cycles:                 {num_cycles} complete cycles")
-        logger.info("=" * 60)
+        # period = k + 1
+        # num_cycles = total_training_steps // period
+        # logger.info("=" * 60)
+        # logger.info("[Serial Training] Initialized scheduler:")
+        # logger.info(f"  actor_training_steps:       {self.actor_training_steps}")
+        # logger.info(f"  actor_steps_per_draft_step: {k}")
+        # logger.info(f"  draft_training_steps:       {self.draft_training_steps}")
+        # logger.info(f"  total_training_steps:       {self.total_training_steps}")
+        # logger.info(f"  training_ratio:             Actor:{self.actor_training_steps} / Draft:{self.draft_training_steps} = {k}:1")
+        # logger.info(f"  period (k+1):               {period} steps/cycle")
+        # logger.info(f"  num_cycles:                 {num_cycles} complete cycles")
+        # logger.info("=" * 60)
 
     def _step_once_parallel(self, metrics: dict, timing_raw: dict, sample_batch_size: int) -> KVBatchMeta:
         """并行训练流程（原有逻辑）：Actor 和 Draft 同时训练"""
@@ -793,6 +803,12 @@ class PPOTrainer(ABC):
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
+        print("*"*100)
+        print("*"*100)
+        print("replay buffer跑完"*100)
+        print("*"*100)
+        print("*"*100)
+
         # 4. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
@@ -800,6 +816,12 @@ class PPOTrainer(ABC):
 
         # 5. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
+
+        print("*"*100)
+        print("*"*100)
+        print("balance batch跑完"*100)
+        print("*"*100)
+        print("*"*100)
 
         # ========== v3：只有一种步，draft 每 k 步搭一次车 ==========
         # v1/v2 在这里分流成「Actor 步」和「Draft 步」，而 rollout 在 :790 早已跑完，
@@ -825,7 +847,7 @@ class PPOTrainer(ABC):
                 f"{' + draft (collect & train)' if train_draft else ''}"
             )
 
-            # 6. compute old_log_prob
+            # 6. compute old_log_prob  ★ 特征采集就藏在这次前向里
             with marked_timer("old_log_prob", timing_raw, color="blue"):
                 batch = self._compute_old_log_prob(batch, metrics=metrics)
 
