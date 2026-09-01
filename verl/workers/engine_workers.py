@@ -79,6 +79,17 @@ def _eagle3_scalar_global_step(data) -> int:
     return int(value) if value is not None else 0
 
 
+def _empty_dispatch_output():
+    """An empty, concat-able return value for side-effect-only worker methods.
+
+    ``make_nd_compute_dataproto_dispatch_fn``'s collect step asserts every
+    surviving rank returned something concat-able (``decorator.py:260``), so a
+    method that only mutates worker state still has to hand back a DataProto-ish
+    value. ``None`` fails that assert.
+    """
+    return tu.get_tensordict(tensor_dict={}, non_tensor_dict={}).cpu()
+
+
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
 
@@ -1000,7 +1011,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         engine = getattr(self.actor, "engine", None)
         state = getattr(engine, "_eagle3", None)
         if state is None or not state.enabled:
-            return None
+            return _empty_dispatch_output()
         global_step = _eagle3_scalar_global_step(data)
         # 必须在 engine 的 mode 上下文内跑。param_offload=True 时，policy 参数只在
         # train_mode/eval_mode 内被搬到设备上（BaseEngineCtx._context_switch），
@@ -1016,7 +1027,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # zero_grad。
         with engine.eval_mode():
             refresh_frozen_teacher_head(engine, global_step=global_step)
-        return None
+        # 返回空 TensorDict 而不是 None：本方法只做副作用（快照挂到 state 上），
+        # 但 make_nd_compute_dataproto_dispatch_fn 的 collect 阶段会断言各 rank
+        # 的返回值可 concat（decorator.py:260），None 不满足，真机表现为
+        # "AssertionError: expecting concatable output, but got element type NoneType"。
+        #
+        # 注意不能照抄 update_draft_deferred 的 "非 src rank 返回 None"：那个能过
+        # 是因为 collect_mask 只保留 src rank 的输出（collect_nd_compute:245），
+        # 它的 None 恰好都落在被过滤掉的 rank 上。本方法所有 rank 都到这里，
+        # src rank 也必须给出可 concat 的值。
+        return _empty_dispatch_output()
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
