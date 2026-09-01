@@ -154,8 +154,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         self.model_config.model_type = self.config.model_type
         self.engine: BaseEngine = EngineRegistry.new(
-            model_type=self.config.model_type,
-            backend=self.engine_config.strategy,
+            model_type=self.config.model_type,             # 传入参数是"language_model"
+            backend=self.engine_config.strategy,           # 传入参数是megatron
             model_config=self.model_config,
             engine_config=self.engine_config,
             optimizer_config=self.optimizer_config,
@@ -196,7 +196,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Reset the model engine to the initial state. If the engine is not initialized,
         we initialize it. Otherwise, reload ckpt and reset states
         """
-        self.engine.initialize()
+        self.engine.initialize()         # engine初始化，会跳到transformer_impl.py的MegatronEngine.initialize()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
@@ -796,8 +796,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 )
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
-            self.actor = self.actor_worker_cls(config=actor_training_config)
-            self.actor.reset()
+            self.actor = self.actor_worker_cls(config=actor_training_config)    # 建内层 actor worker，actor_worker_cls = TrainingWorker
+            self.actor.reset()                                                  # ← 往这，RPC 到内层 worker，跳到TrainingWorker.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
@@ -952,7 +952,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # (#2 权重只在训过的步同步，镜像 SpeCo speco_worker.py:921 的 last_trained_step）
         engine._eagle3_last_global_step = global_step
 
-        with self.engine.train_mode(disable_auto_offload=True), Timer(name="draft_deferred", logger=None) as timer:
+        with engine.train_mode(disable_auto_offload=True), Timer(name="draft_deferred", logger=None) as timer:
             result = train_draft_from_store(
                 engine,
                 state.feature_store,
@@ -962,7 +962,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 batch_size_per_gpu=train_bsz,
             )
 
-        if result is None or not self.engine.is_mp_src_rank_with_outputs():
+        if result is None or not engine.is_mp_src_rank_with_outputs():
             return None
         losses = result["losses"]
         metrics = {
@@ -1014,7 +1014,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 只 load 模型参数（load_grad=False），跳过优化器状态——对 8B 模型来说
         # Adam state 是权重的两倍，白搬一趟。也不会像 train_mode 那样在退出时
         # zero_grad。
-        with self.engine.eval_mode():
+        with engine.eval_mode():
             refresh_frozen_teacher_head(engine, global_step=global_step)
         return None
 
