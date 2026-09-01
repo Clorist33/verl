@@ -11,128 +11,173 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""P4 回归：update_draft_deferred 必须通过 self.actor.engine 访问 engine。
+"""P4：update_draft_deferred 的 engine 访问方式，以及"不进 mode 上下文"约束。
 
-20260831 真机第二次回归 (k=1 第一次 draft 触发):
-    engine_workers.py:955   with self.engine.train_mode(...)
-    AttributeError: 'ActorRolloutRefWorker' object has no attribute 'engine'
+两个真机 bug 的回归：
 
-ActorRolloutRefWorker 从未给 self.engine 赋值，只有 self.actor.engine。
-三处（955/965/1017）误写成 self.engine 的 bug 从 v3 P4 起就在 (92d8e375)，
-只是所有运行在此之前全部因其他错误失败，从未走到第一次 draft 训练入口。
+1. 20260831 —— ``self.engine`` 不存在（该类只有 ``self.actor.engine``）：
+       AttributeError: 'ActorRolloutRefWorker' object has no attribute 'engine'
+   955/965 两处是 v3 P4 的既有 bug，此前所有运行都死在到达这里之前。
+
+2. 20260901 07:58 —— 退出 ``train_mode`` 时清 policy 梯度：
+       param_and_grad_buffer.py:962  self.grad_data.zero_()
+       RuntimeError: The tensor has a non-zero number of elements, but its data
+                     is not allocated yet.
+   ``disable_auto_offload=True`` 让进入时不搬 grad buffer（这是对的：policy 此刻
+   应留在 CPU，正是 v3 显存错峰的前提），但 ``zero_grad_on_exit`` 默认 True，
+   退出时对已被 ``storage().resize_(0)`` 的 buffer 做 ``zero_()``。并行分支不炸，
+   是因为它的 ``train_mode`` 是嵌套的 —— 外层已经把 buffer 搬上了设备。
+
+修法是**根本不进 engine 的 mode 上下文**：draft 训练不需要 policy 的任何上下文，
+理由详见 engine_workers.update_draft_deferred 的注释。所以本文件断言的是"两个 mode
+上下文都没被进入"，而不是"进入后参数在设备上"。
 """
 
 import inspect
 
 
-class _FakeEngineCtx:
-    """记录进出、并在进入时把参数搬到 device、退出时根据 timer 决定是否回搬。"""
-
-    def __init__(self, engine, disable_auto_offload=False):
-        self.engine = engine
-        self.disable_auto_offload = disable_auto_offload
-
-    def __enter__(self):
-        self.engine.events.append("enter:train")
-        self.engine.param_device = "npu"
-        return self
-
-    def __exit__(self, *exc):
-        self.engine.events.append("exit:train")
-        if not self.disable_auto_offload:
-            self.engine.param_device = "cpu"
-        return False
-
-
 class _FakeEngine:
-    """最简化的 engine mock，能记录 mode 切换和 rank 判断。"""
+    """记录 mode 上下文是否被进入 —— 被进入即视为回归，直接抛。"""
 
     def __init__(self, is_src_rank=True):
-        self.events = []
-        self.param_device = "cpu"
+        self.mode_calls = []
         self._is_src_rank = is_src_rank
-        self._eagle3 = type("S", (), {"enabled": True})()
+        self._eagle3 = None  # 由用例按需替换
         self.module = object()
 
-    def train_mode(self, disable_auto_offload=False, **kw):
-        return _FakeEngineCtx(self, disable_auto_offload=disable_auto_offload)
+    def train_mode(self, **kw):
+        self.mode_calls.append(("train_mode", kw))
+        raise AssertionError(
+            "update_draft_deferred 不应进入 engine.train_mode：退出时会对已 offload 的 "
+            "policy grad buffer 做 zero_()，真机以 RuntimeError 崩溃（20260901）。"
+        )
+
+    def eval_mode(self, **kw):
+        self.mode_calls.append(("eval_mode", kw))
+        raise AssertionError("update_draft_deferred 不应进入 engine.eval_mode")
 
     def is_mp_src_rank_with_outputs(self):
         return self._is_src_rank
 
 
-def test_update_draft_deferred_accesses_engine_via_actor(monkeypatch):
-    """核心断言：必须用 self.actor.engine，不能用 self.engine (后者不存在)。"""
+def _make_worker(engine):
+    """只挂真实类确实拥有的属性。
+
+    刻意不设 ``worker.engine`` —— ActorRolloutRefWorker 没有这个属性，凭空加上会把
+    ``self.engine`` 的 AttributeError 盖住（20260831 就是这么漏过去的）。
+    """
     from verl.workers import engine_workers
-
-    engine = _FakeEngine(is_src_rank=True)
-    seen = {}
-
-    def _fake_train(eng, store, **kw):
-        # 记录被调用时的状态
-        seen["param_device"] = eng.param_device
-        seen["global_step"] = kw.get("global_step")
-        seen["engine_id"] = id(eng)
-        return {"losses": [0.1, 0.2], "num_windows": 1}
-
-    monkeypatch.setattr(
-        "verl.models.eagle3.deferred_training.train_draft_from_store",
-        _fake_train,
-    )
 
     worker = object.__new__(engine_workers.ActorRolloutRefWorker)
     worker.actor = type("A", (), {"engine": engine})()
-    # 注意不能给 worker.engine 赋值 —— ActorRolloutRefWorker 真实没有这个属性，
-    # 凭空造一个会把 self.engine 的 AttributeError 盖住（20260831 真机回归）。
-
-    import torch
-    from tensordict import TensorDict
-
-    from verl.models.eagle3.feature_store import DraftFeatureStore
-    from verl.utils import tensordict_utils as tu
-
-    store = DraftFeatureStore(max_records=8)
-    # update_draft_deferred 从 engine._eagle3.feature_store 取 store，不是 worker._eagle3_state
-    engine._eagle3 = type("S", (), {"enabled": True, "feature_store": store})()
-
-    data = TensorDict({"x": torch.zeros(2, 2)}, batch_size=[2])
-    tu.assign_non_tensor_data(data, "global_steps", 5)
-
-    # 配置 eagle3，让 _draft_config_at_step 返回有效配置
     worker.actor_config = type(
         "C",
         (),
         {
-            "eagle3_k": 1,
-            "eagle3_draft_bsz": 4,
-            "eagle3_draft_micro_bsz": 2,
-            "eagle3_draft_steps_per_trigger": 10,
+            "draft_ppo_micro_batch_size_per_gpu": 8,
+            "draft_steps_per_trigger": 10,
+            "draft_train_batch_size_per_gpu": 4,
         },
     )()
-
-    # 绕开 @register 装饰器，直接调用底层函数
-    fn = engine_workers.ActorRolloutRefWorker.update_draft_deferred
-    while hasattr(fn, "__wrapped__"):
-        fn = fn.__wrapped__
-    result = fn(worker, data)
-
-    # 断言确实调用了 train_draft_from_store，且传入的是通过 self.actor.engine 取到的 engine
-    assert seen["engine_id"] == id(engine), "传入的 engine 对象不是预期的实例"
-    assert seen["param_device"] == "npu", (
-        "train_draft_from_store 被调用时参数应已在设备上 (train_mode 已进入)"
-    )
-    assert seen["global_step"] == 5
-    assert result is not None
-    from verl.utils import tensordict_utils as tu
-    metrics = tu.get_non_tensor_data(result, "metrics", {})
-    assert "draft_loss" in metrics
+    return worker
 
 
-def test_update_draft_deferred_returns_none_on_non_src_rank(monkeypatch):
-    """非 src rank 应返回 None，且不会走到 metrics 构造（会因 losses 不存在而失败）。"""
+def _unwrapped(name):
+    """绕开 @register / @DistProfiler 装饰器，拿到底层函数。"""
     from verl.workers import engine_workers
 
-    engine = _FakeEngine(is_src_rank=False)  # ← 关键：非 src rank
+    fn = getattr(engine_workers.ActorRolloutRefWorker, name)
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
+def _batch(global_step):
+    import torch
+    from tensordict import TensorDict
+
+    from verl.utils import tensordict_utils as tu
+
+    data = TensorDict({"x": torch.zeros(2, 2)}, batch_size=[2])
+    tu.assign_non_tensor_data(data, "global_steps", global_step)
+    return data
+
+
+def _attach_store(engine):
+    """update_draft_deferred 从 engine._eagle3.feature_store 取 store。"""
+    from verl.models.eagle3.feature_store import DraftFeatureStore
+
+    store = DraftFeatureStore(max_records=8)
+    engine._eagle3 = type("S", (), {"enabled": True, "feature_store": store})()
+    return store
+
+
+def test_trains_without_entering_any_mode_context(monkeypatch):
+    """核心：能跑通，且全程没进过 train_mode / eval_mode。"""
+    engine = _FakeEngine(is_src_rank=True)
+    _attach_store(engine)
+    seen = {}
+
+    def _fake_train(eng, store, **kw):
+        seen["engine_id"] = id(eng)
+        seen["global_step"] = kw.get("global_step")
+        seen["steps_per_trigger"] = kw.get("steps_per_trigger")
+        seen["batch_size_per_gpu"] = kw.get("batch_size_per_gpu")
+        return {"losses": [0.1, 0.2], "num_windows": 3}
+
+    monkeypatch.setattr(
+        "verl.models.eagle3.deferred_training.train_draft_from_store", _fake_train
+    )
+
+    worker = _make_worker(engine)
+    result = _unwrapped("update_draft_deferred")(worker, _batch(5))
+
+    # _FakeEngine 的 train_mode/eval_mode 直接抛，所以能走到这里就说明没进过；
+    # 仍显式断言一次，防止将来 fake 改成不抛时静默放过。
+    assert engine.mode_calls == [], f"进入了 mode 上下文：{engine.mode_calls}"
+
+    # engine 必须来自 self.actor.engine
+    assert seen["engine_id"] == id(engine), "传入的 engine 不是 self.actor.engine"
+    assert seen["global_step"] == 5
+    # 配置面板要如实透传，否则 P1-2 的内循环调不动
+    assert seen["steps_per_trigger"] == 10
+    assert seen["batch_size_per_gpu"] == 4
+
+    from verl.utils import tensordict_utils as tu
+
+    metrics = tu.get_non_tensor_data(result, "metrics", {})
+    assert metrics["draft_updates"] == [2.0]
+    assert metrics["draft_windows"] == [3.0]
+
+
+def test_global_step_recorded_on_engine_for_weight_sync_guard(monkeypatch):
+    """engine._eagle3_last_global_step 要在训练前挂好。
+
+    P2 的"只在训过的步导出 draft 权重"守卫靠它判断；漏了会导致每步都同步，
+    或者反过来永远不同步。
+    """
+    engine = _FakeEngine()
+    _attach_store(engine)
+    monkeypatch.setattr(
+        "verl.models.eagle3.deferred_training.train_draft_from_store",
+        lambda eng, store, **kw: {"losses": [0.5], "num_windows": 1},
+    )
+
+    worker = _make_worker(engine)
+    _unwrapped("update_draft_deferred")(worker, _batch(11))
+
+    assert getattr(engine, "_eagle3_last_global_step", None) == 11
+
+
+def test_returns_none_on_non_src_rank(monkeypatch):
+    """非 src rank 返回 None。
+
+    这些 None 会被 collect_mask 过滤掉（collect_nd_compute:245），所以不违反
+    dispatch 的 concat 契约 —— 与 snapshot_draft_teacher 不同，后者所有 rank
+    都返回，src rank 的 None 活到断言处，必须给可 concat 的值。
+    """
+    engine = _FakeEngine(is_src_rank=False)
+    _attach_store(engine)
     called = []
 
     def _fake_train(eng, store, **kw):
@@ -140,69 +185,47 @@ def test_update_draft_deferred_returns_none_on_non_src_rank(monkeypatch):
         return {"losses": [0.1], "num_windows": 1}
 
     monkeypatch.setattr(
-        "verl.models.eagle3.deferred_training.train_draft_from_store",
-        _fake_train,
+        "verl.models.eagle3.deferred_training.train_draft_from_store", _fake_train
     )
 
-    worker = object.__new__(engine_workers.ActorRolloutRefWorker)
-    worker.actor = type("A", (), {"engine": engine})()
-
-    import torch
-    from tensordict import TensorDict
-
-    from verl.models.eagle3.feature_store import DraftFeatureStore
-    from verl.utils import tensordict_utils as tu
-
-    store = DraftFeatureStore(max_records=8)
-    # update_draft_deferred 从 engine._eagle3.feature_store 取 store，不是 worker._eagle3_state
-    engine._eagle3 = type("S", (), {"enabled": True, "feature_store": store})()
-
-    data = TensorDict({"x": torch.zeros(2, 2)}, batch_size=[2])
-    tu.assign_non_tensor_data(data, "global_steps", 5)
-
-    worker.actor_config = type(
-        "C",
-        (),
-        {
-            "eagle3_k": 1,
-            "eagle3_draft_bsz": 4,
-            "eagle3_draft_micro_bsz": 2,
-            "eagle3_draft_steps_per_trigger": 10,
-        },
-    )()
-
-    fn = engine_workers.ActorRolloutRefWorker.update_draft_deferred
-    while hasattr(fn, "__wrapped__"):
-        fn = fn.__wrapped__
-    result = fn(worker, data)
+    worker = _make_worker(engine)
+    result = _unwrapped("update_draft_deferred")(worker, _batch(5))
 
     assert called, "train_draft_from_store 应该被调用了"
     assert result is None, "非 src rank 应返回 None，而不是尝试构造 metrics"
 
 
-def test_code_uses_engine_not_self_engine():
-    """防回归：update_draft_deferred 内不得出现 self.engine（应为局部变量 engine）。"""
+def test_returns_none_when_eagle3_disabled():
+    """eagle3 未启用时早退，且不碰 mode 上下文。"""
+    engine = _FakeEngine()
+    engine._eagle3 = None
+
+    worker = _make_worker(engine)
+    result = _unwrapped("update_draft_deferred")(worker, _batch(5))
+
+    assert result is None
+    assert engine.mode_calls == []
+
+
+def test_source_avoids_self_engine_and_mode_context():
+    """静态守卫：不得出现 self.engine，也不得重新引入 mode 上下文。"""
+    import re
+
     from verl.workers import engine_workers
 
     src = inspect.getsource(engine_workers.ActorRolloutRefWorker.update_draft_deferred)
-    # 只看代码，剥掉注释和文档字符串
-    lines = [ln for ln in src.splitlines() if not ln.strip().startswith("#")]
-    code = "\n".join(lines)
+    code = "\n".join(ln for ln in src.splitlines() if not ln.strip().startswith("#"))
 
-    # 断言用的是局部变量 engine（通过 self.actor.engine 取得）
     assert "engine = self.actor.engine" in code or "engine = getattr(self.actor" in code
-    assert "engine.train_mode(" in code
     assert "engine.is_mp_src_rank_with_outputs()" in code
-
-    # 断言不出现 self.engine（这是 AttributeError 的来源）
-    import re
-
-    # 排除 self.actor.engine，只抓 self.engine（后面不是 .actor）
-    bad_pattern = re.compile(r"\bself\.engine\b(?!\s*=\s*self\.actor\.engine)")
-    matches = bad_pattern.findall(code)
-    assert not matches, (
-        f"发现 {len(matches)} 处 self.engine（应为局部变量 engine 或 self.actor.engine）"
+    assert not re.findall(r"\bself\.engine\b", code), (
+        "self.engine 不存在于 ActorRolloutRefWorker；应使用局部变量 engine"
     )
+    assert "train_mode(" not in code, (
+        "重新引入了 train_mode：退出时会对已 offload 的 policy grad buffer 做 zero_()，"
+        "而 zero_grad_on_exit=False 也挡不住异常路径"
+    )
+    assert "eval_mode(" not in code
 
 
 if __name__ == "__main__":

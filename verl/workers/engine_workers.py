@@ -963,7 +963,36 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # (#2 权重只在训过的步同步，镜像 SpeCo speco_worker.py:921 的 last_trained_step）
         engine._eagle3_last_global_step = global_step
 
-        with engine.train_mode(disable_auto_offload=True), Timer(name="draft_deferred", logger=None) as timer:
+        # 刻意不进入 engine 的 train_mode/eval_mode：v3 的 draft 训练不需要 policy 的
+        # 任何上下文，而 train_mode 的三件事在这里全部落空或有害。
+        #
+        #   1) _context_switch 搬参数 —— 必须不搬。此刻 policy 的参数/优化器/grad
+        #      buffer 都已被 update_actor 退出时搬回 CPU（storage().resize_(0)，见
+        #      megatron_utils.offload_megatron_model_to_cpu）。draft 训练时显存是空的
+        #      正是 v3 相对并行方案的核心收益；搬回来是每卡 ~32GB（8B/TP4 的参数+Adam
+        #      state+grad buffer），直接摧毁这个错峰。
+        #   2) module.train() —— 只作用于 engine.module（policy 的 chunk 列表）。draft
+        #      被刻意用单元素列表挂在 GPT 上（eagle3_patch.py 的 _eagle3_draft），不在
+        #      policy 子模块树里，这个调用碰不到它。
+        #   3) 退出时 optimizer_zero_grad() —— 清的是 **policy** 的 grad buffer，而
+        #      draft 用独立的 torch.optim.AdamW（engine_support._build_draft_optimizer）。
+        #      这一条不只是无用：grad_offload=True 时 buffer 已被 resize_(0)，对它
+        #      zero_() 会抛 "tensor has a non-zero number of elements, but its data is
+        #      not allocated yet"。真机就是这么崩的（20260901 07:58）。
+        #      注意 zero_grad_on_exit=False 也挡不住异常路径（__exit__ 的条件是
+        #      `zero_grad_on_exit or exc_type is not None`），那会用这个 RuntimeError
+        #      盖掉 draft 训练本身的真实异常。不进上下文才彻底。
+        #
+        # 副作用是 engine.mode 不会被设成 "train"。唯一的消费者是 mindspeed 后端的
+        # FP8 权重复用（mindspeed/utils.py:240，靠它决定是否释放高精度权重），而它挂在
+        # engine.to() 里 —— 本路径不搬运，所以永远不会执行到；megatron 后端更不经过
+        # 那段代码。若将来迁到 mindspeed+FP8，要重新决策的是"draft 训练期间 policy 的
+        # 高精度权重该不该释放"，而不是简单把上下文加回来。
+        #
+        # draft 训练自身所需的一切都独立于这套机制：权重在 setup 时就 .to(device) 常驻，
+        # embedding 是从 policy copy_ 来的独立副本（非共享引用），优化器自带
+        # optim_offload 开关，teacher 是已在设备上的 frozen_lm_head 快照。
+        with Timer(name="draft_deferred", logger=None) as timer:
             result = train_draft_from_store(
                 engine,
                 state.feature_store,
