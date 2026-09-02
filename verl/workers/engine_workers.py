@@ -1014,7 +1014,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 只 load 模型参数（load_grad=False），跳过优化器状态——对 8B 模型来说
         # Adam state 是权重的两倍，白搬一趟。也不会像 train_mode 那样在退出时
         # zero_grad。
-        with self.engine.eval_mode():
+        with engine.eval_mode():
             refresh_frozen_teacher_head(engine, global_step=global_step)
         return None
 
