@@ -175,13 +175,15 @@ class ActorConfig(BaseConfig):
     # _build_draft_lr_scheduler 一直在吃 "constant"+warmup=0 的 fallback 并返回 None。
 
     # === V3 采集计划配置面板（#4，对标 SpeCo speco_base.yaml:58-66）===
-    # 通过 +actor_rollout_ref.actor.draft_collect_window_train_rows=N 等方式在脚本里覆盖。
-    # None = 使用 collect_plan.py 里的代码默认值（与 SpeCo 对齐）。
-    draft_collect_window_train_rows: Optional[int] = None   # 默认 512
-    draft_collect_window_mode: Optional[str] = None         # 默认 "front"
-    draft_collect_sample_rate: Optional[float] = None       # 默认 1.0
-    draft_collect_max_samples_per_replica: Optional[int] = None   # 默认 16
-    draft_collect_max_tokens_per_replica: Optional[int] = None    # 默认 16384
+    # 通过 ++actor_rollout_ref.actor.draft_collect_window_train_rows=N 等方式在脚本里覆盖。
+    # None = 回退到 collect_plan.py 的 DEFAULT_*（唯一真相来源，与 SpeCo 对齐）。
+    # 这里刻意不复写具体数值：engine_workers._eagle3_collect_config 直接 import
+    # 那些常量，注释里再抄一遍只会随时间漂移。
+    draft_collect_window_train_rows: Optional[int] = None    # 同时是长度门（N+1 行）
+    draft_collect_window_mode: Optional[str] = None          # "front" | "random"
+    draft_collect_sample_rate: Optional[float] = None        # <1.0 按 hash 丢弃候选
+    draft_collect_max_samples_per_replica: Optional[int] = None   # 每 rank 每步窗口数上限
+    draft_collect_max_tokens_per_replica: Optional[int] = None    # 每 rank 每步行数上限
 
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384

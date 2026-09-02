@@ -919,18 +919,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         Mirrors verl_speco/config/speco_base.yaml:58-66 and exposes them via
         ActorConfig.draft_collect_* fields so callers can override via hydra
         without touching code (P2#4 panel).
+
+        The fallbacks are imported from collect_plan rather than written out here.
+        They used to be literals in both places, which made collect_plan's
+        DEFAULT_* dead constants: a change there would silently fail to take
+        effect for anyone who left the ActorConfig fields unset.
         """
+        from verl.models.eagle3.collect_plan import (
+            DEFAULT_MAX_SAMPLES_PER_REPLICA,
+            DEFAULT_MAX_TOKENS_PER_REPLICA,
+            DEFAULT_SAMPLE_RATE,
+            DEFAULT_WINDOW_MODE,
+            DEFAULT_WINDOW_TRAIN_ROWS,
+        )
+
         cfg = self.actor_config
         _g = lambda attr, default: (  # noqa: E731
             v if (v := getattr(cfg, attr, None)) is not None else default
         )
         return {
             "global_step": global_step,
-            "window_train_rows": int(_g("draft_collect_window_train_rows", 512)),
-            "window_mode": str(_g("draft_collect_window_mode", "front")),
-            "sample_rate": float(_g("draft_collect_sample_rate", 1.0)),
-            "max_samples_per_replica": int(_g("draft_collect_max_samples_per_replica", 16)),
-            "max_tokens_per_replica": int(_g("draft_collect_max_tokens_per_replica", 16384)),
+            "window_train_rows": int(_g("draft_collect_window_train_rows", DEFAULT_WINDOW_TRAIN_ROWS)),
+            "window_mode": str(_g("draft_collect_window_mode", DEFAULT_WINDOW_MODE)),
+            "sample_rate": float(_g("draft_collect_sample_rate", DEFAULT_SAMPLE_RATE)),
+            "max_samples_per_replica": int(
+                _g("draft_collect_max_samples_per_replica", DEFAULT_MAX_SAMPLES_PER_REPLICA)
+            ),
+            "max_tokens_per_replica": int(
+                _g("draft_collect_max_tokens_per_replica", DEFAULT_MAX_TOKENS_PER_REPLICA)
+            ),
         }
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

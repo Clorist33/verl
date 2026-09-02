@@ -153,7 +153,7 @@ class TaskRunnerV1:
         try:
             self.trainer = trainer_cls(config=config)    # 创建trainer实例
             self.trainer.init()                          # 初始化trainer(例如初始化分布式环境、创建模型、创建 optimizer、创建 rollout worker、装配 EAGLE3)
-            self.init_agent_loop_manager()               # 准备 rollout 侧（vLLM 引擎起来，加载 draft）。初始化agent_loop_manager，它负责管理生成轨迹（trajectory）的循环，管理rollout生成，负责怎么生成样本
+            self.init_agent_loop_manager()               # 准备 rollout 侧（vLLM 引擎起来，加载 draft）。初始化agent_loop_manager，它负责管理生成轨迹（trajectory）的循环，管理rollout生成，负责怎么生成样本。这里面会调用build_eagle3_speculative_config：让 vLLM 以 method=eagle3 从磁盘加载 draft、挂 SpecDecodeStatLogger 
             self.trainer.fit(self.agent_loop_manager)    # 开始训练循环，trainer负责怎么用agent_loop_manager生成的这些样本训练 PPO。训练阶段：循环跑 N 个 step
             succeeded = True
         finally:
