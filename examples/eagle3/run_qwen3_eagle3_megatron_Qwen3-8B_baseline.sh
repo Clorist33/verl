@@ -74,8 +74,8 @@ NNODES=${NNODES:-1}
 NPUS_PER_NODE=${NPUS_PER_NODE:-16}
 
 # ===== EAGLE3 draft 训练总开关 =====
-DRAFT_ENABLE_TRAIN=${DRAFT_ENABLE_TRAIN:-True}
-EAGLE3_ENABLE_ROLLOUT=${EAGLE3_ENABLE_ROLLOUT:-True}   # rollout 侧投机解码开启（要看接受率）
+DRAFT_ENABLE_TRAIN=${DRAFT_ENABLE_TRAIN:-False}
+EAGLE3_ENABLE_ROLLOUT=${EAGLE3_ENABLE_ROLLOUT:-False}   # rollout 侧投机解码开启（要看接受率）
 TTT_LENGTH=${TTT_LENGTH:-1}
 
 # ===== V3 串行训练调度 =====
@@ -83,7 +83,7 @@ TTT_LENGTH=${TTT_LENGTH:-1}
 # ACTOR_TRAINING_STEPS   : 总训练步数（v3: total == actor；每步都是完整 Actor 步）
 # ACTOR_STEPS_PER_DRAFT_STEP (k) : 每 k 步搭车训一次 draft（周期是 k，不是 v1/v2 的 k+1）。
 #   不整除只是最后一个不完整周期少训一次 draft，校验只警告不拦截（P0-1）。
-ENABLE_SERIAL_TRAINING=${ENABLE_SERIAL_TRAINING:-True}
+ENABLE_SERIAL_TRAINING=${ENABLE_SERIAL_TRAINING:-False}
 ACTOR_TRAINING_STEPS=${ACTOR_TRAINING_STEPS:-100}       # 首轮验证默认 30 步（k=5 -> 6 次 draft 训练）
 ACTOR_STEPS_PER_DRAFT_STEP=${ACTOR_STEPS_PER_DRAFT_STEP:-5}
 

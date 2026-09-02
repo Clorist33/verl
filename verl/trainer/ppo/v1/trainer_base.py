@@ -487,7 +487,7 @@ class PPOTrainer(ABC):
                 self.on_step_begin()
 
                 self._start_profiling()
-                batch = self.step(metrics, self.timing_raw)
+                batch = self.step(metrics, self.timing_raw)     # 开始进入前向步
                 self._stop_profiling()
 
                 # 2. save checkpoint
@@ -580,10 +580,10 @@ class PPOTrainer(ABC):
         assert train_batch_size % self.parameter_sync_step == 0, (
             f"train_batch_size ({train_batch_size}) must be divisible by "
             f"parameter_sync_step ({self.parameter_sync_step})"
-        )
+        )   # self.parameter_sync_step 代表？？？？？？？？？？？？？？？？？？？？？
         sample_batch_size = train_batch_size // self.parameter_sync_step
 
-        self._add_batch_to_generate()
+        self._add_batch_to_generate()  # 进行推理
 
         metrics_aggregator = MetricsAggregator()
         combined_keys: list = []
@@ -591,7 +591,7 @@ class PPOTrainer(ABC):
         combined_partition_id = "train"
         for _ in range(self.parameter_sync_step):
             iter_metrics: dict = {}
-            batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)    # 进行训练
             sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
             metrics_aggregator.add_step_metrics(iter_metrics, sample_count=sample_count)
             combined_keys.extend(batch.keys)
@@ -850,7 +850,7 @@ class PPOTrainer(ABC):
 
             # 11a. draft teacher 快照：必须在 update_actor **之前**。
             #      本步采到的 hidden 是 compute_log_prob 那次前向产的，用的是本步
-            #      任何一次 mini-batch 更新**之前**的权重。teacher 的算法是
+            #      任何一次 mini-batch 更新**之前**的权重。teacher logits 的算法是
             #      lm_head @ 已存 hidden，所以 lm_head 必须来自同一批权重。
             #      放到 update_actor 之后会把「更新后的头」配到「更新前的身体」上，
             #      这个组合不对应任何真实存在过的模型 —— 而且不报错，只表现为
@@ -869,6 +869,11 @@ class PPOTrainer(ABC):
             self.actor_steps += 1
             logger.debug(f"[Serial Training] Global Step {self.global_steps}: "
                         f"Actor step {self.actor_steps}/{self.actor_training_steps}")
+            print("*"*100)
+            print("*"*100)
+            print(f"actor 的 {self.actor_steps} 训练完成")
+            print("*"*100)
+            print("*"*100)
 
             # 12. draft 训练：必须在 update_actor **之后**。
             #     此时 policy 的激活与梯度已释放，draft 训练的显存与 policy 峰值错开
@@ -880,6 +885,11 @@ class PPOTrainer(ABC):
                 self.draft_steps += 1
                 logger.debug(f"[Serial Training] Global Step {self.global_steps}: "
                             f"Draft step {self.draft_steps}/{self.draft_training_steps}")
+                print("*"*100)
+                print("*"*100)
+                print(f"draft 的 {self.draft_steps} 训练完成")
+                print("*"*100)
+                print("*"*100)
 
         return batch
 
