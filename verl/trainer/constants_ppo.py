@@ -74,7 +74,11 @@ PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
         "NCCL_DEBUG": "WARN",
-        "VLLM_LOGGING_LEVEL": "WARN",
+        # 允许外部覆盖：runtime_env 会盖掉 worker 进程里已有的同名环境变量，写死 WARN
+        # 时在启动脚本里 export INFO 是无效的。而 vLLM 的 "GPU KV cache size" 和
+        # "Maximum concurrency" 都是 INFO 级日志 —— 排查投机解码是否压低了 decode
+        # 并发度，必须靠这两行。默认仍是 WARN，不改变现有行为。
+        "VLLM_LOGGING_LEVEL": os.environ.get("VLLM_LOGGING_LEVEL", "WARN"),
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
         # TODO: disable compile cache due to cache corruption issue
         # https://github.com/vllm-project/vllm/issues/31199

@@ -52,7 +52,7 @@ EAGLE3_ENABLE_ROLLOUT=${EAGLE3_ENABLE_ROLLOUT:-True}  # 启用 rollout 投机推
 NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
 
 # ===== 关键修复：Draft TP 对齐 =====
-DRAFT_TP=${DRAFT_TP:-4}  # 修复：设为 4，与 policy TP 一致
+DRAFT_TP=${DRAFT_TP:-1}  # 修复：设为 4，与 policy TP 一致
 USE_MEGATRON_DRAFT=${USE_MEGATRON_DRAFT:-True}
 
 # ===== 硬件配置 =====
@@ -66,7 +66,11 @@ gen_tp=${GEN_TP:-4}
 TRAIN_FILE=${TRAIN_FILE:-/home/t00972278/dataset/dapo-math-17k/dapo-math-17k.parquet}
 max_prompt_length=${MAX_PROMPT_LENGTH:-512}
 max_response_length=${MAX_RESPONSE_LENGTH:-8192}
-train_prompt_bsz=${TRAIN_BATCH_SIZE:-4}
+# 32 而非 4：对齐正式训练的 rollout 规模（32 prompt x n=8 = 256 序列，÷DP4 = 64/rank）。
+# batch=4 时每 rank 只有 8 条序列，KV cache 压力和正式跑差一个量级 —— 而"开头 gen
+# 劣化 51%、后期收敛到 8%"这个现象最可能的成因正是 draft 挤占 KV cache，小 batch
+# 会把它掩盖掉，对照就失去意义。
+train_prompt_bsz=${TRAIN_BATCH_SIZE:-32}
 n_resp_per_prompt=${ROLLOUT_N:-8}
 
 # ===== Rollout-Only 模式配置 =====
@@ -159,6 +163,15 @@ ACTOR=(
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${train_etp}
     actor_rollout_ref.actor.megatron.use_mbridge=True
     actor_rollout_ref.actor.megatron.vanilla_mbridge=True
+    # offload 必须和正式训练一致，否则这个脚本测不出可比的 gen 时间。
+    # verl 是 colocated 的：训练与推理共用同一批卡。不 offload 时 Megatron 的 policy
+    # （8B/TP4 每卡约 4GB）全程驻留 NPU，vLLM 只能用剩下的显存装 KV cache，KV cache
+    # 一小，并发 decode 的序列数就少，生成变慢。20260902 实测：本脚本未开 offload 时
+    # step1 gen=447s，而开了 offload 的正式训练同工作量只要 313s —— 活干得更少反而慢
+    # 43%，测出的数里混进了"无 offload 导致的 KV cache 不足"，与投机开销分不开。
+    actor_rollout_ref.actor.megatron.param_offload=True
+    actor_rollout_ref.actor.megatron.grad_offload=True
+    actor_rollout_ref.actor.megatron.optimizer_offload=True
 )
 
 REF=(
@@ -172,6 +185,8 @@ REF=(
     actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${train_etp}
     actor_rollout_ref.ref.megatron.use_mbridge=True
     actor_rollout_ref.ref.megatron.vanilla_mbridge=True
+    # ref model 同样要 offload —— 它是第二份 8B 权重，不搬走就再吃掉一份 KV cache 预算
+    actor_rollout_ref.ref.megatron.param_offload=True
 )
 
 ROLLOUT=(
@@ -180,7 +195,9 @@ ROLLOUT=(
     actor_rollout_ref.rollout.temperature=1.0
     actor_rollout_ref.rollout.top_p=1.0
     actor_rollout_ref.rollout.top_k=-1
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7
+    # 可覆盖：开 EAGLE3 后 draft 权重 + 投机所需的 KV slot 都从这个比例里扣，
+    # 留给 target 的 KV cache 变小 → decode 并发下降 → 生成变慢。提高它是最直接的补偿。
+    actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL:-0.7}
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp}
     actor_rollout_ref.rollout.enforce_eager=False
     actor_rollout_ref.rollout.enable_chunked_prefill=True

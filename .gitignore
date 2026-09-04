@@ -141,3 +141,6 @@ examples/eagle3/extra-info/
 # （tensorboard_log 下的 tfevents 于 20260831 用 filter-branch 从本分支剥离）
 verl_eagle3/
 tensorboard_log/
+# 训练产出的 checkpoint 目录（实测 323GB），绝不能进版本库。
+# 既有的 **/*.ckpt 只挡单个文件，挡不住这个目录。
+ckpts/

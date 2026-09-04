@@ -34,7 +34,7 @@
 set -xeuo pipefail
 
 # ===== 关键环境变量必须最先设置 =====
-export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}  #,8,9,10,11,12,13,14,15
 export HCCL_CONNECT_TIMEOUT=1500
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60500
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-62000
@@ -192,8 +192,8 @@ experiment_name=${EXPERIMENT_NAME:-qwen3_8b_eagle3_serial_v3}
 CKPTS_DIR=${CKPTS_DIR:-"/home/t00972278/verl/ckpts/${project_name}/${experiment_name}"}
 
 # ===== profiling：首轮验证默认关（看曲线不看 trace）；要开设 PROFILE_STEPS="[2,3]" =====
-PROFILE_STEPS=${PROFILE_STEPS:-null}
-PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-False}
+PROFILE_STEPS=${PROFILE_STEPS:-[2]}
+PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-True}
 PROFILE_ACTOR=${PROFILE_ACTOR:-False}
 PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile}
 
@@ -330,7 +330,7 @@ ACTOR=(
     actor_rollout_ref.actor.profiler.tool_config.npu.discrete=True
     actor_rollout_ref.actor.profiler.tool_config.npu.contents="['npu','cpu']"
     actor_rollout_ref.actor.profiler.tool_config.npu.level=level1
-    actor_rollout_ref.actor.profiler.tool_config.npu.analysis=False
+    actor_rollout_ref.actor.profiler.tool_config.npu.analysis=True
 )
 
 REF=(
@@ -369,7 +369,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.profiler.all_ranks=False
     actor_rollout_ref.rollout.profiler.ranks="[0]"
     actor_rollout_ref.rollout.profiler.tool_config.npu.discrete=True
-    actor_rollout_ref.rollout.profiler.tool_config.npu.contents="['npu','cpu']"
+    actor_rollout_ref.rollout.profiler.tool_config.npu.contents="['npu','cpu','stack']"
     actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_start=30
     actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_end=60
 )

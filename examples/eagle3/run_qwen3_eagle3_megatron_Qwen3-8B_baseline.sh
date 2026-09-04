@@ -191,11 +191,17 @@ project_name=${PROJECT_NAME:-verl_eagle3}
 experiment_name=${EXPERIMENT_NAME:-qwen3_8b_eagle3_serial_v3}
 CKPTS_DIR=${CKPTS_DIR:-"/home/t00972278/verl/ckpts/${project_name}/${experiment_name}"}
 
-# ===== profiling：首轮验证默认关（看曲线不看 trace）；要开设 PROFILE_STEPS="[2,3]" =====
-PROFILE_STEPS=${PROFILE_STEPS:-null}
-PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-False}
+# ===== profiling：基线对照也要能采 rollout trace。
+# 要同时采到 vLLM 推理侧，必须 PROFILE_ROLLOUT=True（把 -profiler-config 传给 vLLM）
+# + PROFILE_STEPS 含实际执行的步 + trainer_base 的 llm_server_manager.start/stop_profile 已启用。
+# 默认关（看曲线不看 trace）；要开见下方注释三行。
+PROFILE_STEPS=${PROFILE_STEPS:-[2]}
+PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-True}
 PROFILE_ACTOR=${PROFILE_ACTOR:-False}
-PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile}
+PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile_baseline}
+# 注意：vLLM 引擎内部 profiler 有 delay_iterations=30，要到第 2 步之后才真正记录，
+# 且 PROFILE_STEPS 决定 do_profile 是否成立。建议 ACTOR_TRAINING_STEPS>=4，
+# 并把 PROFILE_SAVE_PATH 设到单独目录（如 profile_baseline），避免覆盖开投机的 trace。
 
 # ===== 指标持久化 =====
 export VERL_FILE_LOGGER_ROOT="/home/t00972278/desk/eagle3_train/eagle3_result/logs/metrics"

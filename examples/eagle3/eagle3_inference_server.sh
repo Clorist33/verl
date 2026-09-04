@@ -23,7 +23,7 @@ unset https_proxy
 
 # ===== 环境变量（对齐训练脚本）=====
 export VLLM_USE_V1=1
-export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3}
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
 export HCCL_CONNECT_TIMEOUT=1500
 export HCCL_OP_EXPANSION_MODE="AIV"
 export HCCL_BUFFSIZE=1024
@@ -43,20 +43,23 @@ NUM_SPEC_TOKENS=${NUM_SPEC_TOKENS:-3}
 
 python -m vllm.entrypoints.openai.api_server \
     --model ${POLICY_PATH} \
-    --served-model-name qwen3 \
+    --served-model-name qwen3-8B \
     --trust-remote-code \
-    --max-num-seqs 16 \
-    --max-model-len 32768 \
+    --max-num-seqs 256 \
+    --max-model-len 9216 \
     --max-num-batched-tokens 8192 \
     --tensor-parallel-size 4 \
-    --data-parallel-size 1 \
+    --data-parallel-size 4 \
     --port 9090 \
-    --distributed_executor_backend "mp" \
     --enable-chunked-prefill \
     --async-scheduling True \
+    --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/home/t00972278/profiling", "torch_profiler_with_stack": false}' \
     --gpu-memory-utilization 0.7 \
     --speculative-config "{\"method\": \"eagle3\",\"model\": \"${DRAFT_PATH}\", \"num_speculative_tokens\": ${NUM_SPEC_TOKENS}}"
 
 
 
 # --enable-expert-parallel \
+# --distributed_executor_backend "mp" \
+
+

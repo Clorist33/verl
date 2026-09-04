@@ -838,7 +838,7 @@ class PPOTrainer(ABC):
             # update_actor 之后的独立入口，靠 eagle3_collect_only 采到的特征驱动。
             self._eagle3_serial_flags = {'enable_draft_training': False, 'train_draft_only': False}
             batch.extra_info.update(self._eagle3_serial_flags)
-            batch.extra_info["eagle3_collect_only"] = train_draft
+            batch.extra_info["eagle3_collect_only"] = train_draft         # draft训练数据采集总闸
             batch.extra_info["global_steps"] = self.global_steps
             self._eagle3_collect_this_step = train_draft
 
@@ -849,7 +849,7 @@ class PPOTrainer(ABC):
 
             # 6. compute old_log_prob  ★ 特征采集就藏在这次前向里
             with marked_timer("old_log_prob", timing_raw, color="blue"):
-                batch = self._compute_old_log_prob(batch, metrics=metrics)
+                batch = self._compute_old_log_prob(batch, metrics=metrics)   
 
             # 7. [OPTIONAL] compute ref_log_prob
             if self.use_reference_policy:
@@ -1669,7 +1669,7 @@ class PPOTrainer(ABC):
                 self.critic_wg.start_profile(profile_step=self.global_steps)
             # drive the rollout (vLLM) engine's discrete profiler; NPU/torch rollout trace
             # is written to VLLM_TORCH_PROFILER_DIR only while start/stop bracket generate()
-            # self.llm_server_manager.start_profile()
+            self.llm_server_manager.start_profile()
 
     def _stop_profiling(self) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
@@ -1692,7 +1692,7 @@ class PPOTrainer(ABC):
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:
                 self.critic_wg.stop_profile()
-            # self.llm_server_manager.stop_profile()
+            self.llm_server_manager.stop_profile()
 
     def _fetch_one_gen_batch(self) -> TensorDict:
         """Fetch one ``gen_batch_size`` chunk from the dataloader."""
@@ -1882,7 +1882,7 @@ class PPOTrainer(ABC):
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             }
         )
-        output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
+        output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)    # RPC ─► 跳到/verl/verl/workers/engine_workers.py:compute_log_prob()
         assert len(output) == len(batch)
 
         fields = ["entropy", "log_probs", "response_mask"]
