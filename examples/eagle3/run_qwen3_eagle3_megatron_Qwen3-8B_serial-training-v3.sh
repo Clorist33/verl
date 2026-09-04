@@ -195,7 +195,7 @@ CKPTS_DIR=${CKPTS_DIR:-"/home/t00972278/verl/ckpts/${project_name}/${experiment_
 PROFILE_STEPS=${PROFILE_STEPS:-[2]}
 PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-True}
 PROFILE_ACTOR=${PROFILE_ACTOR:-False}
-PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile}
+PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile_eagle3}
 
 # ===== 指标持久化 =====
 export VERL_FILE_LOGGER_ROOT="/home/t00972278/desk/eagle3_train/eagle3_result/logs/metrics"
